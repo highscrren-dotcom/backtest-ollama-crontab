@@ -5,6 +5,11 @@ import { CC_TELEGRAM_API_HASH, CC_TELEGRAM_API_ID } from "./params";
 import { readFile } from "fs/promises";
 
 export const getTelegram = singleshot(async () => {
+    if (!CC_TELEGRAM_API_ID || !CC_TELEGRAM_API_HASH) {
+        throw new Error(
+            "CC_TELEGRAM_API_ID/CC_TELEGRAM_API_HASH не заданы. Получи свои на https://my.telegram.org и пропиши в .env (дефолтные креды апстрима удалены в форке — см. README-FORK.md).",
+        );
+    }
     try {
         const session = await readFile("./session.txt", "utf-8");
         const stringSession = new StringSession(session);

@@ -1,5 +1,7 @@
 version: '3.8'
 
+# ФОРК-ПРАВКА: пароль из окружения (CC_REDIS_PASSWORD в .env рядом с compose
+# или в шелле); дефолт сохранён для локальной разработки.
 services:
   redis:
     image: redis:7.4.1
@@ -7,8 +9,8 @@ services:
     ports:
       - "6379:6379"
     environment:
-      - REDIS_PASSWORD=mysecurepassword
-    command: ["redis-server", "--requirepass", "mysecurepassword"]
+      - REDIS_PASSWORD=${CC_REDIS_PASSWORD:-mysecurepassword}
+    command: ["sh", "-c", "redis-server --requirepass \"$${REDIS_PASSWORD}\""]
     volumes:
       - ./redis_data:/data
     restart: always

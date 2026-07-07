@@ -43,7 +43,10 @@ const SIGNAL_FORMAT: ParseFormat<SignalFields> = {
         multi: true,
     },
     stoploss: {
-        pattern: /СТОП-?ЛОСС:\s*\$?([\d.,]+)/i,
+        // ФОРК-ПРАВКА: июль-2026 шаблон канала пишет «СТОП ЛОСС» с пробелом
+        // (живые посты 2026-07-07, id 5698/5699/5700) — допускаем дефис/пробел/
+        // слитно, как в нашем parse_signals.mjs (paperhands/pump_bench).
+        pattern: /СТОП[-\s]?ЛОСС:\s*\$?([\d.,]+)/i,
         transform: (_, m) => num(m[1]),
         validate: (v) => isNum(v),
     },

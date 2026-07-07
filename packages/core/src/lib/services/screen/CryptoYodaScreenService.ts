@@ -6,7 +6,10 @@ import ParserService from "../core/ParserService";
 import { ScraperMessage } from "../../../model/ScraperMessage.model";
 import { ParserMessage } from "../../../model/ParserMessage.model";
 import ScraperService from "../core/ScraperService";
+import { CC_CHANNEL_LIST } from "../../../config/params";
 
+// Тип-маркер семейства шаблона (риск-гейт и crawler фильтруют по нему);
+// фактический канал каждого сообщения — в поле channel (см. CC_CHANNEL_LIST).
 const CHANNEL_NAME = "crypto_yoda_channel" as const;
 
 const num = (s: string) => parseFloat(s.replace(",", "."));
@@ -67,12 +70,20 @@ export class CryptoYodaScreenService {
         return parserList.map((msg) => ({ ...msg, type: CHANNEL_NAME }));
     }
 
+    // ФОРК-ПРАВКА: мультиканальность — скрейпим все каналы из CC_CHANNEL_LIST
+    // (дефолт — только crypto_yoda_channel, поведение апстрима не меняется).
+    // Последовательно, не Promise.all: MTProto-флуд-лимиты на user-session.
     public screenDay = async (date: Date) => {
         this.loggerService.log("cryptoYodaScreenService screenDay", {
             date,
+            channelList: CC_CHANNEL_LIST,
         });
-        const scraperList = await this.scraperService.scrapeDay(CHANNEL_NAME, date);
-        return await this.parseDay(scraperList);
+        const resultList: ParserMessage<typeof SIGNAL_FORMAT, typeof CHANNEL_NAME>[] = [];
+        for (const channel of CC_CHANNEL_LIST) {
+            const scraperList = await this.scraperService.scrapeDay(channel, date);
+            resultList.push(...await this.parseDay(scraperList));
+        }
+        return resultList;
     }
 }
 

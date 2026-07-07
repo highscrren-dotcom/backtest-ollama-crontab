@@ -24,3 +24,12 @@ export const CC_REDIS_USER = process.env.CC_REDIS_USER || "default";
 export const CC_REDIS_PASSWORD = process.env.CC_REDIS_PASSWORD || "mysecurepassword";
 
 export const CC_MONGO_CONNECTION_STRING = process.env.CC_MONGO_CONNECTION_STRING || "mongodb://localhost:27017/backtest-pro?wtimeoutMS=15000";
+
+// ФОРК-ПРАВКА: список Telegram-каналов для скрейпа (через запятую). Каналы должны
+// использовать шаблон сигналов семейства Crypto Yoda (SIGNAL_FORMAT в
+// CryptoYodaScreenService); дедуп в Mongo — по (channel, messageId), поэтому
+// пересечение messageId между каналами безопасно.
+export const CC_CHANNEL_LIST = (process.env.CC_CHANNEL_LIST || "crypto_yoda_channel")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);

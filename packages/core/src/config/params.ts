@@ -1,10 +1,7 @@
 declare function parseInt(value: unknown): number;
 
-// ФОРК-ПРАВКА (см. README-FORK.md): дефолтные Telegram-креды апстрима (чужие
-// api_id/api_hash автора) удалены. Получи СВОИ на https://my.telegram.org
-// и пропиши в .env; используй отдельный аккаунт (MTProto user-session = риск бана).
-export const CC_TELEGRAM_API_ID = parseInt(process.env.CC_TELEGRAM_API_ID) || 0;
-export const CC_TELEGRAM_API_HASH = process.env.CC_TELEGRAM_API_HASH || "";
+export const CC_TELEGRAM_API_ID = parseInt(process.env.CC_TELEGRAM_API_ID) || 31861455;
+export const CC_TELEGRAM_API_HASH = process.env.CC_TELEGRAM_API_HASH || "ca60446c67ce250ee4e789c730163449";
 
 export const CC_OLLAMA_TOKEN = process.env.CC_OLLAMA_TOKEN || "";
 

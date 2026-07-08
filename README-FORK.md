@@ -7,11 +7,13 @@
 
 ## Отличия от upstream
 
-1. **Чужие Telegram-креды удалены** (`packages/{core,main}/src/config/params.ts`):
-   апстрим хардкодил api_id/api_hash автора как fallback. Теперь `CC_TELEGRAM_API_ID`
-   / `CC_TELEGRAM_API_HASH` обязательны в `.env` (получить: https://my.telegram.org);
-   `getTelegram()` бросает понятную ошибку, если не заданы. ⚠️ Используй ОТДЕЛЬНЫЙ
-   аккаунт — MTProto user-session несёт риск бана.
+1. ~~Чужие Telegram-креды удалены~~ **ОТКАЧЕНО 2026-07-08** (решение владельца по
+   переписке с автором: Telegram-сторону ведёт автор, «зачем двойная работа»).
+   `packages/{core,main}/src/config/params.ts` и `getTelegram()` возвращены к
+   апстриму: дефолтные app-креды автора (api_id 31861455) снова fallback,
+   `CC_TELEGRAM_API_ID`/`CC_TELEGRAM_API_HASH` — опциональный override.
+   Наш локальный `.env` пока держит свои креды — на них авторизована живая
+   QR-сессия (`session.txt`); смена api_id потребует переавторизации.
 2. **Переключатель риск-гейта `CC_RISK_GATE`** (`SignalLogicService.ts`):
    - `llm` (дефолт) — как в апстриме: Ollama Cloud `gpt-oss:120b` исполняет правила
      промптом (нужен `CC_OLLAMA_TOKEN` подписки);

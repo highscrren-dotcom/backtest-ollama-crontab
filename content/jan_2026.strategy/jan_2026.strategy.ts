@@ -29,6 +29,12 @@ addStrategySchema({
       return null;
     }
 
+    // Спот шортить не умеет: торгуем только LONG (решение владельца 2026-07-08,
+    // spot-only). Фильтр единый для backtest/paper/live — статистика сопоставима.
+    if (signal.direction === "short") {
+      return null;
+    }
+
     const closePrice = await getClosePrice(symbol, "1m");
     if (closePrice < signal.entryFrom || closePrice > signal.entryTo) {
       return null;

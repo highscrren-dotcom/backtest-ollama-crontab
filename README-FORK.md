@@ -27,6 +27,19 @@
    ParserItem pump-anomaly: `--screened` берёт только `riskAction=follow` из
    `screen-items`. Шов с нашим OOS-стендом (`paperhands/example/scripts/pump_bench/`).
 5. **`.env.example`** дополнен всеми переменными (upstream перечислял не все).
+6. **Мультиканальность скрейпа** (`CC_CHANNEL_LIST`, дефолт `crypto_yoda_channel` —
+   поведение апстрима не меняется) + **дрейф-алерт шаблона канала**
+   (`scripts/drift-alert.sh`, крон ежечасно: рост «СИГНАЛ…extracted:null» в логах
+   paper/live = канал сменил формат).
+7. **Live-контур jan_2026 (2026-07-08, go-live владельца):**
+   `content/jan_2026.strategy/modules/live.module.ts` — data-схема автора +
+   **дословный авторский Binance Spot адаптер** из его доков
+   (`_reference/backtest-kit-skills/...broker-adapter.mdx`, порт на API 15.2.0 —
+   отличия перечислены в шапке файла); фильтр `direction==="short"→null` в
+   `getSignal` (спот не шортит; у автора аналога нет — его адаптер кидает throw
+   на short, что даёт вечные ретраи); `scripts/live-preflight.mjs` — read-only
+   проверка ключей/прав/баланса/бота перед запуском. Запуск — @reboot-строка
+   крона (`--live --noFlush --ui --telegram`).
 
 ## Запуск (кратко; полная схема — README.md апстрима)
 

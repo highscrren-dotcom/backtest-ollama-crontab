@@ -2,13 +2,14 @@
 // Данные: дословно корневой modules/live.module.ts автора.
 // Брокер: ДОСЛОВНЫЙ production-адаптер Binance Spot автора
 // (_reference/backtest-kit-skills/source/configuration/broker-adapter.mdx, Tab "Spot"),
-// портированный на API backtest-kit 15.2.0. Отличия от оригинала:
+// портированный на API backtest-kit 15.2.0 (в доке — старый API).
+// Отличия ТОЛЬКО ради совместимости:
 //   1) onSignalOpenCommit → onOrderOpenCommit (type="schedule" — no-op: отложенный
 //      вход отслеживает движок, реальный ордер ставится при активации type="active");
 //   2) onSignalCloseCommit → onOrderCloseCommit;
-//   3) guard payload.backtest → return в commit-хуках;
-//   4) waitForInit дополнен read-only fetchBalance (fail-fast по ключам на старте).
-// Тела хелперов и хуков — байт-в-байт авторские.
+//   3) guard payload.backtest → return (требование доки поля backtest в 15.2.0);
+//   4) ccxt v4: 2-арг amountToPrecision (транкация — дефолт), типы Binance/Order.
+// Тела хелперов и хуков — байт-в-байт авторские, своей логики нет.
 import { addExchangeSchema, roundTicks, setConfig, Broker } from "backtest-kit";
 import type {
   IBroker,
@@ -193,9 +194,7 @@ async function createLimitOrderAndWait(
 Broker.useBrokerAdapter(
   class implements Partial<IBroker> {
     async waitForInit(): Promise<void> {
-      const exchange = await getSpotExchange();
-      await exchange.fetchBalance();
-      console.log("SpotBrokerAdapter: ключи валидны, spot-баланс доступен");
+      await getSpotExchange();
     }
 
     async onOrderOpenCommit(payload: BrokerOrderOpenPayload): Promise<void> {

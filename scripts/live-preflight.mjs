@@ -20,18 +20,24 @@ try {
     enableRateLimit: true,
   });
   const bal = await ex.fetchBalance();
-  const info = bal.info ?? {};
   const usdt = bal.USDT?.free ?? 0;
   console.log(`Binance: ключи ВАЛИДНЫ`);
-  console.log(`  canTrade=${info.canTrade} canWithdraw=${info.canWithdraw} permissions=${JSON.stringify(info.permissions ?? [])}`);
   console.log(`  USDT free=${usdt}`);
-  if (info.canTrade !== true) {
-    console.log("  ⚠️ canTrade=false — включи Spot Trading в правах ключа");
+  // Права именно КЛЮЧА (не аккаунта): GET /sapi/v1/account/apiRestrictions
+  const restr = await ex.sapiGetAccountApiRestrictions();
+  console.log(
+    `  ключ: spotTrading=${restr.enableSpotAndMarginTrading} withdrawals=${restr.enableWithdrawals} reading=${restr.enableReading} ipRestrict=${restr.ipRestrict}`,
+  );
+  if (String(restr.enableSpotAndMarginTrading) !== "true") {
+    console.log("  ⚠️ Spot Trading у ключа ВЫКЛЮЧЕН — ордер не пройдёт");
     fail = true;
   }
-  if (info.canWithdraw === true) {
-    console.log("  ⚠️ canWithdraw=true — ВЫКЛЮЧИ вывод средств у этого ключа!");
+  if (String(restr.enableWithdrawals) === "true") {
+    console.log("  ⚠️ У ключа включён ВЫВОД СРЕДСТВ — выключить!");
     fail = true;
+  }
+  if (String(restr.ipRestrict) !== "true") {
+    console.log("  ℹ️ ключ без IP-whitelist — Binance авто-отзовёт его через ~90 дней");
   }
   if (!(usdt > 0)) {
     console.log("  ⚠️ USDT=0 — spot-кошелёк не финансирован, ордер не пройдёт");

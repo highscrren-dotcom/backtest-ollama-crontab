@@ -17,7 +17,6 @@ import {
   Broker,
   OrderTransientError,
   OrderRejectedError,
-  listenExit,
 } from "backtest-kit";
 import type {
   IBroker,
@@ -513,10 +512,5 @@ Broker.useBrokerAdapter(
 );
 
 Broker.enable();
-
-// §5 ANSWER.md: исчерпание транзиентных попыток = «сеть не даёт работать» —
-// громкая смерть; systemd/супервизор перезапустит, персистентный open-слот
-// продолжит ретраить тот же signalId (reconcile-ветка увидит attempt>0).
-listenExit((error) => {
-  console.error("FATAL (retry exhausted, supervisor must restart):", error?.message ?? error);
-});
+// listenExit НЕ вайрим: @backtest-kit/cli сам дропает процесс на exitEmitter
+// (cli/src/config/setup.ts:46, поправка автора 17.07) — systemd перезапустит.

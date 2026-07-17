@@ -10,7 +10,15 @@
 //   3) guard payload.backtest → return (требование доки поля backtest в 15.2.0);
 //   4) ccxt v4: 2-арг amountToPrecision (транкация — дефолт), типы Binance/Order.
 // Тела хелперов и хуков — байт-в-байт авторские, своей логики нет.
-import { addExchangeSchema, roundTicks, setConfig, Broker } from "backtest-kit";
+import {
+  addExchangeSchema,
+  roundTicks,
+  setConfig,
+  Broker,
+  OrderTransientError,
+  OrderRejectedError,
+  listenExit,
+} from "backtest-kit";
 import type {
   IBroker,
   BrokerOrderOpenPayload,
@@ -101,12 +109,58 @@ addExchangeSchema({
   },
 });
 
-// --- Исполнение: авторский Binance Spot адаптер ---
+// --- Исполнение: авторский Binance Spot адаптер + retry-API 16.0.0 ---
+// (ANSWER.md автора, agent/notes/author-answer-retry-api.md в paperhands):
+// сеть → OrderTransientError (bounded retry с тем же signalId), отказ биржи
+// навсегда → OrderRejectedError (дроп/force-close). Идемпотентность входа:
+// clientOrderId = signalId; при attempt>0 СНАЧАЛА reconcile по origClientOrderId
+// (duplicate-ловушка Binance не срабатывает для мгновенно исполненных ордеров —
+// clientOrderId уникален только среди ОТКРЫТЫХ; сценарий №88/PENGU ловится
+// именно предварительной сверкой).
 
 const FILL_POLL_INTERVAL_MS = 10_000;
 const FILL_POLL_ATTEMPTS = 10;
 const CANCEL_SETTLE_MS = 2_000;
 const STOP_LIMIT_SLIPPAGE = 0.995;
+
+// Сетевой класс ccxt (RequestTimeout, ExchangeNotAvailable, DDoSProtection...)
+// → transient; всё остальное от биржи (InsufficientFunds, InvalidOrder,
+// BadSymbol -1121, min-notional...) → постоянный отказ. Нетипизированное
+// (наши throw) движок сам трактует как transient — их не оборачиваем.
+function toTypedError(e: unknown): Error {
+  if (e instanceof ccxt.NetworkError) {
+    return OrderTransientError.fromError(e as object);
+  }
+  if (e instanceof ccxt.ExchangeError) {
+    return OrderRejectedError.fromError(e as object);
+  }
+  return e as Error;
+}
+
+// Binance: -2013 "Order does not exist" при запросе по origClientOrderId
+function isOrderNotFound(e: unknown): boolean {
+  return String((e as Error)?.message ?? "").includes("-2013");
+}
+
+// Сверка входа по clientOrderId=signalId: был ли прошлый POST исполнен.
+// null = ордера с таким id нет (слать заново); иначе — сырой ответ Binance.
+async function fetchEntryByClientId(
+  exchange: Binance,
+  symbol: string,
+  signalId: string,
+): Promise<{ status: string; executedQty: number } | null> {
+  const market = exchange.market(symbol);
+  try {
+    const raw = await (exchange as any).privateGetOrder({
+      symbol: market.id,
+      origClientOrderId: signalId,
+    });
+    return { status: String(raw.status), executedQty: parseFloat(raw.executedQty ?? "0") };
+  } catch (e) {
+    if (isOrderNotFound(e)) return null;
+    throw toTypedError(e);
+  }
+}
 
 const getSpotExchange = singleshot(async () => {
   const exchange = new ccxt.binance({
@@ -159,9 +213,13 @@ async function createLimitOrderAndWait(
   side: "buy" | "sell",
   qty: number,
   price: number,
-  restore?: { tpPrice: number; slPrice: number }
+  restore?: { tpPrice: number; slPrice: number },
+  clientOrderId?: string,
 ): Promise<void> {
-  const order = await exchange.createOrder(symbol, "limit", side, qty, price);
+  const order = await exchange.createOrder(
+    symbol, "limit", side, qty, price,
+    clientOrderId ? { clientOrderId } : {},
+  );
 
   for (let i = 0; i < FILL_POLL_ATTEMPTS; i++) {
     await sleep(FILL_POLL_INTERVAL_MS);
@@ -200,32 +258,54 @@ Broker.useBrokerAdapter(
     async onOrderOpenCommit(payload: BrokerOrderOpenPayload): Promise<void> {
       if (payload.backtest) return;
       if (payload.type === "schedule") return;
-      const { symbol, cost, priceOpen, priceTakeProfit, priceStopLoss, position } = payload;
+      const { symbol, signalId, cost, priceOpen, priceTakeProfit, priceStopLoss, position, attempt } = payload;
 
       if (position === "short") {
-        throw new Error(`SpotBrokerAdapter: short position is not supported on spot (symbol=${symbol})`);
+        // бизнес-отказ навсегда: спот шортов не знает — дроп без ретраев
+        throw new OrderRejectedError(`SpotBrokerAdapter: short position is not supported on spot (symbol=${symbol})`);
       }
 
       const exchange = await getSpotExchange();
       const qty      = truncateQty(exchange, symbol, cost / priceOpen);
 
       if (qty <= 0) {
-        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${priceOpen}`);
+        throw new OrderRejectedError(`Computed qty is zero for ${symbol} — cost=${cost}, price=${priceOpen}`);
       }
 
       const openPrice = parseFloat(exchange.priceToPrecision(symbol, priceOpen));
       const tpPrice   = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
       const slPrice   = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
 
-      await createLimitOrderAndWait(exchange, symbol, "buy", qty, openPrice);
+      const placeBrackets = async (bracketQty: number): Promise<void> => {
+        try {
+          await exchange.createOrder(symbol, "limit", "sell", bracketQty, tpPrice);
+          await createStopLossOrder(exchange, symbol, bracketQty, slPrice);
+        } catch (err) {
+          // TP/SL не встали — раскрутка позиции; если и она падает сетью,
+          // ретрай того же signalId придёт к reconcile-ветке выше
+          await exchange.createOrder(symbol, "market", "sell", bracketQty);
+          throw toTypedError(err);
+        }
+      };
 
       try {
-        await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
-        await createStopLossOrder(exchange, symbol, qty, slPrice);
+        // №88/PENGU: ретрай (attempt>0) СНАЧАЛА сверяется — вдруг прошлый POST
+        // дошёл и исполнился, а ответ съела сеть. FILLED → достаточно докинуть
+        // TP/SL; живой NEW — ждать его же; нет ордера — слать заново.
+        if (attempt > 0) {
+          const prior = await fetchEntryByClientId(exchange, symbol, signalId);
+          if (prior && prior.executedQty > 0) {
+            const bracketQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+            if (bracketQty > 0) await placeBrackets(bracketQty);
+            return; // вход подтверждён по clientOrderId — покупку НЕ повторяем
+          }
+        }
+        await createLimitOrderAndWait(exchange, symbol, "buy", qty, openPrice, undefined, signalId);
       } catch (err) {
-        await exchange.createOrder(symbol, "market", "sell", qty);
-        throw err;
+        throw toTypedError(err);
       }
+
+      await placeBrackets(qty);
     }
 
     async onOrderCloseCommit(payload: BrokerOrderClosePayload): Promise<void> {
@@ -233,18 +313,25 @@ Broker.useBrokerAdapter(
       const { symbol, currentPrice, priceTakeProfit, priceStopLoss } = payload;
       const exchange = await getSpotExchange();
 
-      const openOrders = await exchange.fetchOpenOrders(symbol);
-      await cancelAllOrders(exchange, openOrders, symbol);
-      await sleep(CANCEL_SETTLE_MS);
+      try {
+        const openOrders = await exchange.fetchOpenOrders(symbol);
+        await cancelAllOrders(exchange, openOrders, symbol);
+        await sleep(CANCEL_SETTLE_MS);
 
-      const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
-      if (qty === 0) return;
+        const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+        if (qty === 0) return;
 
-      const closePrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
-      const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
-      const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+        const closePrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
+        const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+        const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
 
-      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+        await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+      } catch (err) {
+        // сеть → transient (ретрай следующим тиком, bounded CC_ORDER_CLOSE_RETRY_ATTEMPTS,
+        // затем force-close движка — реальную позицию выводит оператор/дежурство);
+        // отказ биржи → rejected (force-close сразу, наш кейс «продавца нет»)
+        throw toTypedError(err);
+      }
     }
 
     async onPartialProfitCommit(payload: BrokerPartialProfitPayload): Promise<void> {
@@ -426,3 +513,10 @@ Broker.useBrokerAdapter(
 );
 
 Broker.enable();
+
+// §5 ANSWER.md: исчерпание транзиентных попыток = «сеть не даёт работать» —
+// громкая смерть; systemd/супервизор перезапустит, персистентный open-слот
+// продолжит ретраить тот же signalId (reconcile-ветка увидит attempt>0).
+listenExit((error) => {
+  console.error("FATAL (retry exhausted, supervisor must restart):", error?.message ?? error);
+});

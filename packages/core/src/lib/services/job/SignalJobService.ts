@@ -52,9 +52,20 @@ const RUN_LIVE_FN = async (self: SignalJobService) => {
     if (await self.screenDbService.findByParserItem(row.id)) {
       continue;
     }
-    const dto = await RUN_IN_CONTEXT_FN(self, row, false);
-    await self.screenDbService.create(dto);
-    await self.parserDbService.markVisited(row.id);
+    try {
+      const dto = await RUN_IN_CONTEXT_FN(self, row, false);
+      await self.screenDbService.create(dto);
+      await self.parserDbService.markVisited(row.id);
+    } catch (error) {
+      // A transient failure (e.g. network outage during the risk gate) must not
+      // leave the row half-processed or kill the loop for the remaining rows.
+      // The row stays unvisited, so the next run picks it up again.
+      self.loggerService.warn("signalJobService RUN_LIVE_FN row failed, will retry", {
+        rowId: row.id,
+        symbol: row.symbol,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 }
 

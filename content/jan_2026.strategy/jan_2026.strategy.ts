@@ -5,11 +5,26 @@ import {
   Log,
   getPositionHighestProfitDistancePnlCost,
   getPositionHighestMaxDrawdownPnlCost,
+  getPositionHighestProfitDistancePnlPercentage,
+  getPositionHighestPnlPercentage,
+  getPositionHighestProfitMinutes,
   getPositionPnlCost,
+  getPositionPnlPercent,
   getClosePrice,
+  commitClosePending,
+  Position,
   Cron,
 } from "backtest-kit";
 import { errorData, getErrorMessage } from "functools-kit";
+
+// Выходы по совету автора (телега 17.07.2026 19:44-46, «НИКОГДА НЕ СТАВЬ TP/SL
+// ФИКСИРОВАННЫМ ОКНОМ»): канальные TP/SL заменены на moonbag (жёсткий стоп −1%)
+// + trailing take / peak staleness (его константы as-is). id сигнала из базы
+// сохранён — канон идемпотентности (clientOrderId=signalId в адаптере).
+const PEAK_STALENESS_SINCE_PROFIT = 1.0;
+const PEAK_STALENESS_SINCE_MINUTES = 240;
+const TRAILING_TAKE = 1.0;
+const HARD_STOP = 1.0;
 
 addStrategySchema({
   strategyName: "jan_2026_strategy",
@@ -55,13 +70,50 @@ addStrategySchema({
 
     return {
       id: signal.id,
-      position: signal.direction,
-      priceStopLoss: signal.stoploss,
-      priceTakeProfit: signal.targets[2],
-      minuteEstimatedTime: Infinity,
+      ...Position.moonbag({
+        position: signal.direction,
+        currentPrice,
+        percentStopLoss: HARD_STOP,
+      }),
+      minuteEstimatedTime: 24 * 60,
       note: JSON.stringify(info, null, 2),
     };
   },
+});
+
+// Trailing take: в профите отдали ≥1 п.п. от пика → закрыть (код автора).
+listenActivePing(async ({ symbol, data }) => {
+  const peakProfitDistance =
+    await getPositionHighestProfitDistancePnlPercentage(symbol);
+  const currentProfit = await getPositionPnlPercent(symbol);
+  if (currentProfit < 0) {
+    return;
+  }
+  if (peakProfitDistance < TRAILING_TAKE) {
+    return;
+  }
+  Log.info("position closed due to the trailing take", { symbol, data });
+  await commitClosePending(symbol, {
+    id: "unknown",
+    note: "# Позиция закрыта по trailing take",
+  });
+});
+
+// Peak staleness: пик ≥1% был ≥240 мин назад — движение выдохлось, закрыть.
+listenActivePing(async ({ symbol, data }) => {
+  const peakProfitCost = await getPositionHighestPnlPercentage(symbol);
+  const peakProfitMinutes = await getPositionHighestProfitMinutes(symbol);
+  if (peakProfitCost < PEAK_STALENESS_SINCE_PROFIT) {
+    return;
+  }
+  if (peakProfitMinutes < PEAK_STALENESS_SINCE_MINUTES) {
+    return;
+  }
+  Log.info("position closed due to the peak staleness", { symbol, data });
+  await commitClosePending(symbol, {
+    id: "unknown",
+    note: "# Позиция закрыта по peak staleness",
+  });
 });
 
 listenActivePing(async ({ symbol, data, currentPrice }) => {

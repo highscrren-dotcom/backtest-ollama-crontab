@@ -62,7 +62,14 @@ networks:
   coolify:
     external: true
 
+# external + фикс-имена: данные переживают смену compose-project (ручной ↔ Coolify)
 volumes:
-  live_logs: {}
-  live_dump: {}
-  live_content_dump: {}
+  live_logs:
+    external: true
+    name: quant_live_logs
+  live_dump:
+    external: true
+    name: quant_live_dump
+  live_content_dump:
+    external: true
+    name: quant_live_content_dump

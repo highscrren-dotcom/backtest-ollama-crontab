@@ -1,0 +1,68 @@
+# Coolify-ресурс «live» (⚠️ БОЕВОЙ движок jan_2026) + крон-вахта.
+# Деплой ТОЛЬКО с ветки deploy-live и только руками.
+# Движок гейтится LIVE_ENABLED (deploy/run-live.sh): 0 = контейнер запаркован,
+# 1 = боевая торговля. Порт 60050 (UI) — только внутренняя сеть.
+x-live-env: &live-env
+  TZ: Asia/Yekaterinburg
+  LIVE_ENABLED: ${LIVE_ENABLED:-0}
+  BINANCE_API_KEY: ${BINANCE_API_KEY}
+  BINANCE_API_SECRET: ${BINANCE_API_SECRET}
+  CC_MONGO_CONNECTION_STRING: ${CC_MONGO_CONNECTION_STRING:-mongodb://quant-mongo:27017/backtest-pro}
+  CC_REDIS_HOST: ${CC_REDIS_HOST:-quant-redis}
+  CC_REDIS_PORT: ${CC_REDIS_PORT:-6379}
+  CC_REDIS_USER: ${CC_REDIS_USER:-default}
+  CC_REDIS_PASSWORD: ${CC_REDIS_PASSWORD}
+  CC_OLLAMA_TOKEN: ${CC_OLLAMA_TOKEN}
+  CC_RISK_GATE: ${CC_RISK_GATE}
+  CC_SYMBOL_LIST: ${CC_SYMBOL_LIST}
+  CC_TELEGRAM_TOKEN: ${CC_TELEGRAM_TOKEN}
+  CC_TELEGRAM_CHANNEL: ${CC_TELEGRAM_CHANNEL}
+  CC_WWWROOT_PORT: "60050"
+  # для duty-watch-server.mjs
+  MONGO_URL: ${CC_MONGO_CONNECTION_STRING:-mongodb://quant-mongo:27017/backtest-pro}
+  NEWS_HEALTH_URL: http://quant-news:8080/api/v1/health
+  PAPER_UI: http://quant-paper:60052/
+  LIVE_UI: http://quant-live:60050/
+
+x-live-volumes: &live-volumes
+  - live_logs:/app/logs
+  - live_dump:/app/dump
+  - live_content_dump:/app/content/jan_2026.strategy/dump
+
+services:
+  live:
+    build: .
+    container_name: quant-live
+    restart: unless-stopped
+    init: true
+    tty: true
+    stop_grace_period: 60s
+    environment: *live-env
+    volumes: *live-volumes
+    healthcheck:
+      # запаркован (LIVE_ENABLED!=1) → healthy; включён → живость по порту UI
+      test: ["CMD-SHELL", "[ \"$$LIVE_ENABLED\" != \"1\" ] && exit 0; bash -c 'exec 3<>/dev/tcp/127.0.0.1/60050' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+    networks: [coolify]
+
+  live-cron:
+    build: .
+    container_name: quant-live-cron
+    restart: unless-stopped
+    init: true
+    command: ["supercronic", "-passthrough-logs", "/app/deploy/crontab-live"]
+    environment: *live-env
+    volumes: *live-volumes
+    networks: [coolify]
+
+networks:
+  coolify:
+    external: true
+
+volumes:
+  live_logs: {}
+  live_dump: {}
+  live_content_dump: {}

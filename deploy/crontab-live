@@ -1,0 +1,3 @@
+# Кроны live-контура (контейнер quant-live-cron, supercronic, TZ=Asia/Yekaterinburg).
+40 * * * * cd /app && bash scripts/drift-alert.sh
+23 */2 * * * cd /app && node scripts/duty-watch-server.mjs >> logs/duty-watch.log 2>&1

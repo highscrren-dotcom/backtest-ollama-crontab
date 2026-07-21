@@ -25,9 +25,10 @@ x-live-env: &live-env
   LIVE_UI: http://quant-live:60050/
 
 x-live-volumes: &live-volumes
-  - live_logs:/app/logs
-  - live_dump:/app/dump
-  - live_content_dump:/app/content/jan_2026.strategy/dump
+  # host-bind вместо named volumes (Coolify префиксует тома uuid'ом даже с external)
+  - /opt/quant/data/live_logs:/app/logs
+  - /opt/quant/data/live_dump:/app/dump
+  - /opt/quant/data/live_content_dump:/app/content/jan_2026.strategy/dump
   # MTProto-сессия ingest-канала: секрет-файл на хосте cfy, в git его НЕТ.
   # На ноуте файл лежит в ТРЁХ местах (воркер стратегии читает из своего cwd) —
   # монтируем один хост-файл во все три пути.
@@ -71,14 +72,3 @@ networks:
   coolify:
     external: true
 
-# external + фикс-имена: данные переживают смену compose-project (ручной ↔ Coolify)
-volumes:
-  live_logs:
-    external: true
-    name: quant_live_logs
-  live_dump:
-    external: true
-    name: quant_live_dump
-  live_content_dump:
-    external: true
-    name: quant_live_content_dump

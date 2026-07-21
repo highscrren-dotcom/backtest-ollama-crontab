@@ -28,6 +28,8 @@ x-live-volumes: &live-volumes
   - live_logs:/app/logs
   - live_dump:/app/dump
   - live_content_dump:/app/content/jan_2026.strategy/dump
+  # MTProto-сессия ingest-канала: секрет-файл на хосте cfy, в git его НЕТ
+  - /opt/quant/env/session.txt:/app/session.txt
 
 services:
   live:

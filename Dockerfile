@@ -15,6 +15,13 @@ RUN npm ci --no-audit --no-fund
 
 COPY . .
 
+# packages/{core,main}/build/*.cjs гитигнорены (артефакты rollup) — собираем в образе;
+# их require'ит config/alias.config.ts, без них движок падает на загрузке конфига.
+# как scripts/linux/build.sh (без dotenv): npm install внутри пакета ставит его
+# deps (telegram, qrcode-terminal и др.), затем rollup-сборка
+RUN cd packages/core && npm install --no-audit --no-fund && npm run build \
+ && cd ../main && npm install --no-audit --no-fund && npm run build
+
 ENV TZ=Asia/Yekaterinburg
 
 CMD ["bash", "deploy/run-live.sh"]

@@ -141,17 +141,17 @@ async function tg(text) {
 
 const now = new Date();
 const stamp = now.toISOString();
-// Зелёный heartbeat ~каждые 6ч (вариант C владельца); red — на любом тике.
-const HEARTBEAT_HOURS = [8, 14, 20];
-const isHeartbeat = HEARTBEAT_HOURS.includes(now.getHours());
-
+// Решение владельца 21.07 (после переезда на сервер): ОТЧЁТ КАЖДЫЙ 2ч-тик —
+// зелёный или красный, всегда со сводкой (mongo/сигналы/баланс). Заменяет
+// вариант C (heartbeat 3×/день) — с ноута контур больше не виден, телега
+// теперь единственное окно в бой.
 let sent = null;
 if (TEST) {
   sent = await tg(`🧪 duty-watch-server тест (Coolify): ${red.length ? "🔴 " + red.join("; ") : "🟢 всё зелёное"} | ${info.join(", ")}`);
 } else if (red.length) {
-  sent = await tg(`🔴 вахта-сервер ${stamp}:\n- ${red.join("\n- ")}`);
-} else if (isHeartbeat) {
-  sent = await tg(`🟢 вахта-сервер жива (${stamp}): всё зелёное | ${info.join(", ")}`);
+  sent = await tg(`🔴 вахта-сервер ${stamp}:\n- ${red.join("\n- ")}\n${info.join(", ")}`);
+} else {
+  sent = await tg(`🟢 вахта-сервер ${stamp}: всё зелёное | ${info.join(", ")}`);
 }
 
 writeFileSync(STATE_FILE, JSON.stringify(state, null, 1));

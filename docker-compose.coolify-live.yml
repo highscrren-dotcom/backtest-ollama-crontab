@@ -28,8 +28,12 @@ x-live-volumes: &live-volumes
   - live_logs:/app/logs
   - live_dump:/app/dump
   - live_content_dump:/app/content/jan_2026.strategy/dump
-  # MTProto-сессия ingest-канала: секрет-файл на хосте cfy, в git его НЕТ
+  # MTProto-сессия ingest-канала: секрет-файл на хосте cfy, в git его НЕТ.
+  # На ноуте файл лежит в ТРЁХ местах (воркер стратегии читает из своего cwd) —
+  # монтируем один хост-файл во все три пути.
   - /opt/quant/env/session.txt:/app/session.txt
+  - /opt/quant/env/session.txt:/app/content/jan_2026.strategy/session.txt
+  - /opt/quant/env/session.txt:/app/packages/main/session.txt
 
 services:
   live:

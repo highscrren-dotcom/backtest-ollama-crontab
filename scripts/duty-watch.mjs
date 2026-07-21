@@ -8,8 +8,9 @@
  *
  * Политика: красное → алерт в телегу КАЖДЫЙ тик, пока красное; смена
  * max messageId / появление signal-items → отдельный алерт (главная вахта);
- * утренний тик (08:23) → «вахта жива» всегда (deadman: нет утреннего пинга =
- * вахта мертва). Числа сравниваем только в node (урок awk/ru_RU).
+ * зелёный heartbeat «вахта жива» в 08:23/14:23/20:23 (вариант C владельца
+ * 20.07 — ~каждые 6ч, не каждые 2ч; deadman: нет heartbeat = вахта мертва).
+ * Числа сравниваем только в node (урок awk/ru_RU).
  * Read-only: ордеров не размещает, Mongo только чтение.
  */
 import { readFileSync, writeFileSync, statSync, existsSync } from "node:fs";
@@ -177,14 +178,18 @@ async function tg(text) {
 
 const now = new Date();
 const stamp = now.toISOString();
-const isMorning = now.getHours() === 8; // тик 08:23 — суточный deadman-пинг
+// Вариант C (владелец 20.07): зелёный heartbeat ~каждые 6ч (утро/день/вечер),
+// а не каждые 2ч — видно, что вахта жива, без спама. red и главная вахта
+// (сигнал канала/сироты) шлются на ЛЮБОМ тике мгновенно.
+const HEARTBEAT_HOURS = [8, 14, 20]; // локальные часы; крон-тики :23 попадают на них
+const isHeartbeat = HEARTBEAT_HOURS.includes(now.getHours());
 
 let sent = null;
 if (TEST) {
   sent = await tg(`🧪 duty-watch тест: вахта установлена. Сейчас: ${red.length ? "🔴 " + red.join("; ") : "🟢 всё зелёное"} | ${info.join(", ")}`);
 } else if (red.length) {
   sent = await tg(`🔴 вахта ${stamp}:\n- ${red.join("\n- ")}`);
-} else if (isMorning) {
+} else if (isHeartbeat) {
   sent = await tg(`🟢 вахта жива (${stamp}): всё зелёное | ${info.join(", ")}`);
 }
 

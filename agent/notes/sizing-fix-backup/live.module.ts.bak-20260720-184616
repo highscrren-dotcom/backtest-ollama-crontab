@@ -265,28 +265,10 @@ Broker.useBrokerAdapter(
       }
 
       const exchange = await getSpotExchange();
-
-      // СПОТ-САЙЗИНГ ПО КЭШУ (владелец 20.07): на споте плеча нет и купить можно
-      // только на живой USDT. Движок даёт номинальный cost (CC_POSITION_ENTRY_COST
-      // $100 по умолчанию, moonbag свой cost не задаёт) — если он больше кэша,
-      // Binance режет "insufficient balance". Берём min(номинал, 98% свободного
-      // USDT) — запас 2% на комиссию/округление. backtest/paper сюда не заходят
-      // (payload.backtest отсечён в начале onOrderOpenCommit).
-      const quoteCcy: string = "USDT";
-      const freeUsdt      = parseFloat(String((await exchange.fetchBalance())?.free?.[quoteCcy] ?? 0));
-      const effectiveCost = Math.min(cost, freeUsdt * 0.98);
-      const minNotional   = exchange.markets[symbol]?.limits?.cost?.min ?? 1;
-      if (effectiveCost < minNotional) {
-        // кэша меньше минимального нотионала биржи — торговать нечем; постоянный
-        // дроп без ретраев (OrderRejectedError), чтобы не спамить каждую минуту.
-        throw new OrderRejectedError(
-          `SpotBrokerAdapter: free USDT ${freeUsdt.toFixed(2)} → cost ${effectiveCost.toFixed(2)} < minNotional ${minNotional} (${symbol}) — вход пропущен`,
-        );
-      }
-      const qty = truncateQty(exchange, symbol, effectiveCost / priceOpen);
+      const qty      = truncateQty(exchange, symbol, cost / priceOpen);
 
       if (qty <= 0) {
-        throw new OrderRejectedError(`Computed qty is zero for ${symbol} — cost=${effectiveCost}, price=${priceOpen}`);
+        throw new OrderRejectedError(`Computed qty is zero for ${symbol} — cost=${cost}, price=${priceOpen}`);
       }
 
       const openPrice = parseFloat(exchange.priceToPrecision(symbol, priceOpen));

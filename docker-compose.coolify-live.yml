@@ -52,7 +52,10 @@ services:
       timeout: 5s
       start_period: 120s
       retries: 3
-    networks: [coolify]
+    networks:
+      coolify:
+        # фикс-имя в сети (Coolify игнорирует container_name; по quant-live ходит вахта)
+        aliases: [quant-live]
 
   live-cron:
     build: .

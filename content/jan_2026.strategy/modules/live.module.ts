@@ -37,6 +37,12 @@ type Order = Awaited<ReturnType<Binance["fetchOpenOrders"]>>[number];
 
 setConfig({
   CC_MAX_STOPLOSS_DISTANCE_PERCENT: 100,
+  // Размер входа $20 (решение владельца 22.07, №112а): депозит ~$95 —
+  // с дефолтными $100 сайзинг упирался в баланс (NOTIONAL/Insufficient, №111);
+  // $20 = до 4 одновременных позиций + запас над биржевым минимумом $5.
+  // ⚠️ Именно ЭТОТ модуль грузит CLI (--entry → chdir в папку стратегии);
+  // корневой modules/live.module.ts рантаймом live НЕ используется.
+  CC_POSITION_ENTRY_COST: 20,
 });
 
 // --- Данные: публичный spot-клиент (схема автора) ---

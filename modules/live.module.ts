@@ -4,6 +4,10 @@ import ccxt from "ccxt";
 
 setConfig({
   CC_MAX_STOPLOSS_DISTANCE_PERCENT: 100,
+  // Размер входа $20 (решение владельца 22.07, №112а): депозит ~$95.6 свободных —
+  // с дефолтными $100 сайзинг упирался в баланс (NOTIONAL/Insufficient, №111),
+  // $20 = 4 одновременных позиции из 12 символов + запас над биржевым минимумом $5.
+  CC_POSITION_ENTRY_COST: 20,
 });
 
 const getExchange = singleshot(async () => {

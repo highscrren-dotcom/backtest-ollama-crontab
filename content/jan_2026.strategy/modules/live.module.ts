@@ -223,6 +223,45 @@ async function createStopLossOrder(
   await exchange.createOrder(symbol, "stop_loss_limit", "sell", qty, limitPrice, { stopPrice });
 }
 
+// FIXME.md Петра (№117б), КОРЕНЬ каскада №114: на споте TP+SL на один объём —
+// это ОДИН OCO-ордер (одна заморозка средств), а не два независимых sell.
+// Раньше TP замораживал монеты → SL падал InsufficientFunds → аварийный
+// market-sell падал о ту же заморозку → сырой throw = вечный транзиент.
+async function placeOcoBrackets(
+  exchange: Binance,
+  symbol: string,
+  qty: number,
+  tpPrice: number,
+  slPrice: number,
+): Promise<void> {
+  const market = exchange.market(symbol);
+  await (exchange as any).privatePostOrderOco({
+    symbol: market.id,
+    side: "SELL",
+    quantity: exchange.amountToPrecision(symbol, qty),
+    price: exchange.priceToPrecision(symbol, tpPrice),
+    stopPrice: exchange.priceToPrecision(symbol, slPrice),
+    stopLimitPrice: exchange.priceToPrecision(symbol, slPrice * STOP_LIMIT_SLIPPAGE),
+    stopLimitTimeInForce: "GTC",
+  });
+}
+
+// TODO 5 FIXME: отмена с верификацией — повторять до пустого fetchOpenOrders
+// (allSettled глотает единичные отказы; продавать можно только разморозив всё).
+async function cancelAllVerified(exchange: Binance, symbol: string): Promise<void> {
+  let lastErr: unknown = null;
+  for (let round = 0; round < CANCEL_ROUNDS; round++) {
+    const open = await exchange.fetchOpenOrders(symbol);
+    if (open.length === 0) return;
+    await cancelAllOrders(exchange, open, symbol);
+    await sleep(CANCEL_SETTLE_MS);
+    const left = await exchange.fetchOpenOrders(symbol);
+    if (left.length === 0) return;
+    lastErr = new Error(`Orders not canceled for ${symbol}: ${left.length} left (round ${round + 1})`);
+  }
+  if (lastErr) throw lastErr;
+}
+
 async function createLimitOrderAndWait(
   exchange: Binance,
   symbol: string,
@@ -280,8 +319,9 @@ async function createLimitOrderAndWait(
   if (restore) {
     const remainingQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
     if (remainingQty > 0) {
-      await exchange.createOrder(symbol, "limit", "sell", remainingQty, restore.tpPrice);
-      await createStopLossOrder(exchange, symbol, remainingQty, restore.slPrice);
+      // №117б: восстановление брекетов — тоже атомарный OCO (та же мина
+      // «TP заморозил → SL упал» жила и здесь)
+      await placeOcoBrackets(exchange, symbol, remainingQty, restore.tpPrice, restore.slPrice);
     }
   }
 
@@ -333,43 +373,63 @@ Broker.useBrokerAdapter(
       const tpPrice   = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
       const slPrice   = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
 
+      // TODO 2 FIXME: раскрутка = СНАЧАЛА cancel всего, что заморозило монеты,
+      // ПОТОМ market-sell по факту свободного остатка; типизация ИСХОДНОЙ
+      // ошибки доходит до движка всегда (раньше сырой InsufficientFunds из
+      // раскрутки демотировал постоянный отказ в вечный транзиент).
+      const unwindPosition = async (unwQty: number, originalErr: unknown): Promise<never> => {
+        try {
+          const open = await exchange.fetchOpenOrders(symbol);
+          await cancelAllOrders(exchange, open, symbol);
+          await sleep(CANCEL_SETTLE_MS);
+          const freeQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+          if (freeQty > 0) {
+            await exchange.createOrder(symbol, "market", "sell", Math.min(freeQty, unwQty));
+          }
+        } catch {
+          // раскрутка не удалась — позицию выводит оператор; исходная ошибка важнее
+        }
+        throw toTypedError(originalErr);
+      };
+
       const placeBrackets = async (bracketQty: number): Promise<void> => {
         try {
-          await exchange.createOrder(symbol, "limit", "sell", bracketQty, tpPrice);
-          await createStopLossOrder(exchange, symbol, bracketQty, slPrice);
+          await placeOcoBrackets(exchange, symbol, bracketQty, tpPrice, slPrice);
         } catch (err) {
-          // TP/SL не встали — раскрутка позиции; если и она падает сетью,
-          // ретрай того же signalId придёт к reconcile-ветке выше
-          await exchange.createOrder(symbol, "market", "sell", bracketQty);
-          throw toTypedError(err);
+          await unwindPosition(bracketQty, err);
         }
       };
 
       try {
-        // №88/PENGU + правило 2 ANSWER.md (№117): ретрай (attempt>0) СНАЧАЛА
-        // сверяется по clientOrderId — прошлый POST мог дойти до биржи.
-        // FILLED/частично исполнен → докинуть TP/SL, покупку НЕ повторять.
-        // Живой NEW → СНЯТЬ (раньше проваливались в новый POST с тем же
-        // clientOrderId → дубль-реджект, а оригинал жил в стакане — каскад №114).
-        if (attempt > 0) {
-          const prior = await fetchEntryByClientId(exchange, symbol, signalId);
-          if (prior && prior.executedQty > 0) {
-            const bracketQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
-            if (bracketQty > 0) await placeBrackets(bracketQty);
-            return; // вход подтверждён по clientOrderId — покупку НЕ повторяем
-          }
-          if (prior && (prior.status === "NEW" || prior.status === "PARTIALLY_FILLED")) {
-            await exchange.cancelOrder(prior.orderId, symbol).catch(() => undefined);
-            await sleep(CANCEL_SETTLE_MS);
-          }
+        // TODO 3 FIXME (№117б): сверка по clientOrderId БЕЗУСЛОВНА, не только
+        // при attempt>0 — после дропа ретрай-слота consumption-ревалидацией
+        // свежая строка приходит с attempt=0 и ТЕМ ЖЕ id, а clientOrderId
+        // исполненного ордера Binance переиспользует (дубль-гард только среди
+        // ОТКРЫТЫХ). Гейт по attempt и превращал один сбой брекетов в
+        // лестницу покупок (№114). Цена сверки для нового id — один вызов
+        // (-2013 → null → слать заново).
+        const prior = await fetchEntryByClientId(exchange, symbol, signalId);
+        if (prior && prior.executedQty > 0) {
+          const bracketQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+          if (bracketQty > 0) await placeBrackets(bracketQty);
+          return; // вход уже куплен прошлой попыткой — покупку НЕ повторяем
+        }
+        if (prior && prior.status === "NEW") {
+          // живой resting-ордер — ждём ЕГО, а не постим дубль (-2010)
+          throw OrderTransientError.fromError(
+            new Error(`entry ${signalId} still resting — waiting`),
+          );
         }
         await createLimitOrderAndWait(exchange, symbol, "buy", qty, openPrice, undefined, signalId);
       } catch (err) {
-        // Правило 3 ANSWER.md: на последней попытке бюджета движка — терминальный
-        // отказ (helper уже снял ордер и откатил частичный филл маркетом).
-        // OrderRejectedError движок потребляет в lastPendingId — сигнал с этим
-        // id больше не переиздаётся, каскад невозможен.
+        // Правило 3 ANSWER.md: бюджет движка исчерпан (attempt 0..4) —
+        // снять свой resting-ордер, если остался, и отказаться ТЕРМИНАЛЬНО:
+        // OrderRejectedError потребляет id, сигнал больше не переиздаётся.
         if (attempt >= LAST_OPEN_ATTEMPT) {
+          const leftover = await fetchEntryByClientId(exchange, symbol, signalId).catch(() => null);
+          if (leftover && (leftover.status === "NEW" || leftover.status === "PARTIALLY_FILLED")) {
+            await exchange.cancelOrder(leftover.orderId, symbol).catch(() => undefined);
+          }
           throw new OrderRejectedError(
             `entry ${signalId} not filled after ${attempt + 1} attempts — giving up`,
           );
@@ -389,17 +449,7 @@ Broker.useBrokerAdapter(
         // Шаги 1-2 ANSWER.md: снять ВСЕ ордера символа с повторами и убедиться,
         // что стакан по символу чист (включая артефакты прошлых попыток и TP
         // траншей-сирот) — только потом выходить в кеш.
-        let cancelError: unknown = null;
-        for (let round = 0; round < CANCEL_ROUNDS; round++) {
-          const openOrders = await exchange.fetchOpenOrders(symbol);
-          if (openOrders.length === 0) { cancelError = null; break; }
-          await cancelAllOrders(exchange, openOrders, symbol);
-          await sleep(CANCEL_SETTLE_MS);
-          const left = await exchange.fetchOpenOrders(symbol);
-          if (left.length === 0) { cancelError = null; break; }
-          cancelError = new Error(`Orders not canceled for ${symbol}: ${left.length} left (round ${round + 1})`);
-        }
-        if (cancelError) throw cancelError; // транзиент — движок ретраит close
+        await cancelAllVerified(exchange, symbol); // throw = транзиент, движок ретраит close
 
         const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
         if (qty === 0) return;
@@ -422,9 +472,7 @@ Broker.useBrokerAdapter(
       const { symbol, percentToClose, currentPrice, priceTakeProfit, priceStopLoss } = payload;
       const exchange = await getSpotExchange();
 
-      const openOrders = await exchange.fetchOpenOrders(symbol);
-      await cancelAllOrders(exchange, openOrders, symbol);
-      await sleep(CANCEL_SETTLE_MS);
+      await cancelAllVerified(exchange, symbol); // №117б: продавать/докупать только разморозив всё
 
       const totalQty = await fetchFreeQty(exchange, symbol);
       if (totalQty === 0) {
@@ -441,8 +489,7 @@ Broker.useBrokerAdapter(
 
       if (remainingQty > 0) {
         try {
-          await exchange.createOrder(symbol, "limit", "sell", remainingQty, tpPrice);
-          await createStopLossOrder(exchange, symbol, remainingQty, slPrice);
+          await placeOcoBrackets(exchange, symbol, remainingQty, tpPrice, slPrice); // №117б
         } catch (err) {
           await exchange.createOrder(symbol, "market", "sell", remainingQty);
           throw err;
@@ -455,9 +502,7 @@ Broker.useBrokerAdapter(
       const { symbol, percentToClose, currentPrice, priceTakeProfit, priceStopLoss } = payload;
       const exchange = await getSpotExchange();
 
-      const openOrders = await exchange.fetchOpenOrders(symbol);
-      await cancelAllOrders(exchange, openOrders, symbol);
-      await sleep(CANCEL_SETTLE_MS);
+      await cancelAllVerified(exchange, symbol); // №117б: продавать/докупать только разморозив всё
 
       const totalQty = await fetchFreeQty(exchange, symbol);
       if (totalQty === 0) {
@@ -474,8 +519,7 @@ Broker.useBrokerAdapter(
 
       if (remainingQty > 0) {
         try {
-          await exchange.createOrder(symbol, "limit", "sell", remainingQty, tpPrice);
-          await createStopLossOrder(exchange, symbol, remainingQty, slPrice);
+          await placeOcoBrackets(exchange, symbol, remainingQty, tpPrice, slPrice); // №117б
         } catch (err) {
           await exchange.createOrder(symbol, "market", "sell", remainingQty);
           throw err;
@@ -488,15 +532,11 @@ Broker.useBrokerAdapter(
       const { symbol, newStopLossPrice } = payload;
       const exchange = await getSpotExchange();
 
+      // №117б: брекеты теперь OCO — отмена одной ноги гасит обе, поэтому
+      // запоминаем цену TP-ноги, сносим всё верифицированно и пересобираем пару.
       const orders  = await exchange.fetchOpenOrders(symbol);
-      const slOrder = orders.find((o) =>
-        o.side === "sell" &&
-        ["stop_loss_limit", "stop", "STOP_LOSS_LIMIT"].includes(o.type ?? "")
-      ) ?? null;
-      if (slOrder) {
-        await exchange.cancelOrder(slOrder.id, symbol);
-        await sleep(CANCEL_SETTLE_MS);
-      }
+      const tpLeg   = orders.find((o) => o.side === "sell" && ["limit", "LIMIT"].includes(o.type ?? "")) ?? null;
+      await cancelAllVerified(exchange, symbol);
 
       const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
       if (qty === 0) {
@@ -504,7 +544,11 @@ Broker.useBrokerAdapter(
       }
 
       const slPrice = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
-      await createStopLossOrder(exchange, symbol, qty, slPrice);
+      if (tpLeg?.price) {
+        await placeOcoBrackets(exchange, symbol, qty, Number(tpLeg.price), slPrice);
+      } else {
+        await createStopLossOrder(exchange, symbol, qty, slPrice);
+      }
     }
 
     async onTrailingTakeCommit(payload: BrokerTrailingTakePayload): Promise<void> {
@@ -512,15 +556,14 @@ Broker.useBrokerAdapter(
       const { symbol, newTakeProfitPrice } = payload;
       const exchange = await getSpotExchange();
 
+      // №117б: OCO-пересборка — запоминаем стоп-ногу, сносим всё, ставим пару заново.
       const orders  = await exchange.fetchOpenOrders(symbol);
-      const tpOrder = orders.find((o) =>
+      const slLeg   = orders.find((o) =>
         o.side === "sell" &&
-        ["limit", "LIMIT"].includes(o.type ?? "")
+        ["stop_loss_limit", "stop", "STOP_LOSS_LIMIT"].includes(o.type ?? "")
       ) ?? null;
-      if (tpOrder) {
-        await exchange.cancelOrder(tpOrder.id, symbol);
-        await sleep(CANCEL_SETTLE_MS);
-      }
+      const slTrigger = Number((slLeg as any)?.stopPrice ?? (slLeg as any)?.triggerPrice ?? 0);
+      await cancelAllVerified(exchange, symbol);
 
       const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
       if (qty === 0) {
@@ -528,7 +571,11 @@ Broker.useBrokerAdapter(
       }
 
       const tpPrice = parseFloat(exchange.priceToPrecision(symbol, newTakeProfitPrice));
-      await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
+      if (slTrigger > 0) {
+        await placeOcoBrackets(exchange, symbol, qty, tpPrice, slTrigger);
+      } else {
+        await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
+      }
     }
 
     async onBreakevenCommit(payload: BrokerBreakevenPayload): Promise<void> {
@@ -536,15 +583,10 @@ Broker.useBrokerAdapter(
       const { symbol, newStopLossPrice } = payload;
       const exchange = await getSpotExchange();
 
+      // №117б: OCO-пересборка (см. onTrailingStopCommit).
       const orders  = await exchange.fetchOpenOrders(symbol);
-      const slOrder = orders.find((o) =>
-        o.side === "sell" &&
-        ["stop_loss_limit", "stop", "STOP_LOSS_LIMIT"].includes(o.type ?? "")
-      ) ?? null;
-      if (slOrder) {
-        await exchange.cancelOrder(slOrder.id, symbol);
-        await sleep(CANCEL_SETTLE_MS);
-      }
+      const tpLeg   = orders.find((o) => o.side === "sell" && ["limit", "LIMIT"].includes(o.type ?? "")) ?? null;
+      await cancelAllVerified(exchange, symbol);
 
       const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
       if (qty === 0) {
@@ -552,7 +594,11 @@ Broker.useBrokerAdapter(
       }
 
       const slPrice = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
-      await createStopLossOrder(exchange, symbol, qty, slPrice);
+      if (tpLeg?.price) {
+        await placeOcoBrackets(exchange, symbol, qty, Number(tpLeg.price), slPrice);
+      } else {
+        await createStopLossOrder(exchange, symbol, qty, slPrice);
+      }
     }
 
     async onAverageBuyCommit(payload: BrokerAverageBuyPayload): Promise<void> {
@@ -560,9 +606,7 @@ Broker.useBrokerAdapter(
       const { symbol, currentPrice, cost, priceTakeProfit, priceStopLoss } = payload;
       const exchange = await getSpotExchange();
 
-      const openOrders = await exchange.fetchOpenOrders(symbol);
-      await cancelAllOrders(exchange, openOrders, symbol);
-      await sleep(CANCEL_SETTLE_MS);
+      await cancelAllVerified(exchange, symbol); // №117б: продавать/докупать только разморозив всё
 
       const existing    = await fetchFreeQty(exchange, symbol);
       const minNotional = exchange.markets[symbol].limits?.cost?.min ?? 1;
@@ -585,8 +629,7 @@ Broker.useBrokerAdapter(
       const totalQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
 
       try {
-        await exchange.createOrder(symbol, "limit", "sell", totalQty, tpPrice);
-        await createStopLossOrder(exchange, symbol, totalQty, slPrice);
+        await placeOcoBrackets(exchange, symbol, totalQty, tpPrice, slPrice); // №117б
       } catch (err) {
         await exchange.createOrder(symbol, "market", "sell", totalQty);
         throw err;

@@ -182,7 +182,7 @@ const getSpotExchange = singleshot(async () => {
 });
 
 function getBase(exchange: Binance, symbol: string): string {
-  return exchange.markets[symbol].base;
+  return exchange.market(symbol).base;
 }
 
 function truncateQty(exchange: Binance, symbol: string, qty: number): number {
@@ -421,7 +421,7 @@ Broker.useBrokerAdapter(
       const openPrice = parseFloat(exchange.priceToPrecision(symbol, priceOpen));
       const tpPrice = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
       const slPrice = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
-      const minNotional = exchange.markets[symbol]?.limits?.cost?.min ?? 1;
+      const minNotional = exchange.market(symbol)?.limits?.cost?.min ?? 5;
 
       // Брекеты на фактический свободный остаток; провал брекетов = провал
       // входа целиком: раскрутка (cancel first → market sell) + типизированный
@@ -445,12 +445,21 @@ Broker.useBrokerAdapter(
 
         if (prior && prior.executedQty > 0) {
           // Прошлый POST исполнился (потерянный ответ / крэш до брекетов).
-          const freeQty = await fetchFreeQty(exchange, symbol);
-          if (freeQty * openPrice >= minNotional) {
-            await confirmWithBrackets();
+          // ⚠️ Найдено ручным brokerdebug (№118а): монеты могут быть уже
+          // ЗАМОРОЖЕНЫ в OCO — free=0, но это НЕ «раскручено». Смотрим
+          // СУММАРНЫЙ баланс монеты; брекеты добрасываем только если живых
+          // ордеров нет (иначе исходная ветка задваивала позицию).
+          const balance = await exchange.fetchBalance();
+          const base = getBase(exchange, symbol);
+          const totalBase = parseFloat(String(balance?.total?.[base] ?? 0));
+          if (totalBase * openPrice >= minNotional) {
+            const open = await exchange.fetchOpenOrders(symbol);
+            if (open.length === 0) {
+              await confirmWithBrackets(); // монеты есть, брекетов нет — добросить
+            }
             return; // вход подтверждён по clientOrderId — покупку НЕ повторяем
           }
-          // остатка нет — прошлый вход уже раскручен (unwind), покупаем заново
+          // монет нет — прошлый вход реально раскручен (unwind), покупаем заново
         } else if (prior && (prior.status === "NEW" || prior.status === "PARTIALLY_FILLED")) {
           // Живой ордер прошлой попытки: СНАЧАЛА снять (clientOrderId
           // освобождается — не будет -2010 duplicate), потом открывать заново.
@@ -503,7 +512,7 @@ Broker.useBrokerAdapter(
         // Шаг 3: выйти в кеш — продать ВЕСЬ свободный баланс монеты (не только
         // объём позиции движка: заодно подметаются транши-сироты).
         const freeQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
-        const minNotional = exchange.markets[symbol]?.limits?.cost?.min ?? 1;
+        const minNotional = exchange.market(symbol)?.limits?.cost?.min ?? 5;
         if (freeQty * currentPrice < minNotional) {
           return; // пыль — позиция уже пуста, закрытие подтверждаем
         }
@@ -673,7 +682,7 @@ Broker.useBrokerAdapter(
       await cancelSweepAndVerify(exchange, symbol);
 
       const existing    = await fetchFreeQty(exchange, symbol);
-      const minNotional = exchange.markets[symbol]?.limits?.cost?.min ?? 1;
+      const minNotional = exchange.market(symbol)?.limits?.cost?.min ?? 5;
       if (existing * currentPrice < minNotional) {
         throw new Error(`AverageBuy skipped: no open position for ${symbol}`);
       }

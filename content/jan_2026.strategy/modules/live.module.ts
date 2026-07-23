@@ -1,15 +1,20 @@
-// Live-модуль jan_2026 (spot).
-// Данные: дословно корневой modules/live.module.ts автора.
-// Брокер: ДОСЛОВНЫЙ production-адаптер Binance Spot автора
-// (_reference/backtest-kit-skills/source/configuration/broker-adapter.mdx, Tab "Spot"),
-// портированный на API backtest-kit 15.2.0 (в доке — старый API).
-// Отличия ТОЛЬКО ради совместимости:
-//   1) onSignalOpenCommit → onOrderOpenCommit (type="schedule" — no-op: отложенный
-//      вход отслеживает движок, реальный ордер ставится при активации type="active");
-//   2) onSignalCloseCommit → onOrderCloseCommit;
-//   3) guard payload.backtest → return (требование доки поля backtest в 15.2.0);
-//   4) ccxt v4: 2-арг amountToPrecision (транкация — дефолт), типы Binance/Order.
-// Тела хелперов и хуков — байт-в-байт авторские, своей логики нет.
+// Live-модуль jan_2026 (spot) — ФИНАЛЬНЫЙ вариант Петра (23.07.2026) +
+// расширенные хуки по его же правилам (№117в).
+//
+// Ядро (open/close + все хелперы) — дословно файл Петра из телеги 16:38
+// («live.module.ts», разбор баги — FIXME.md; сам он его не гонял — ревью наше).
+// Методология tools/wallet-manager:
+//   - вход = commit_buy: лимитка + полл, по таймауту cancel и market-добивка
+//     остатка → вход ГАРАНТИРОВАН, ордер на бирже не остаётся;
+//   - брекеты = commit_trade: TP+SL одним OCO — одна заморозка средств
+//     (два независимых sell на один объём на споте невозможны — корень каскада №114);
+//   - закрытие = commit_cancel: снять ВСЕ ордера по символу с верификацией
+//     чистого стакана, затем продать ВЕСЬ свободный баланс монеты в кеш.
+//
+// Partial/trailing/breakeven/averageBuy-хуки (нужны jan_2026: сигналы канала с
+// таргетами) — по указанию Петра «обязаны следовать тем же правилам» реализованы
+// ниже на ЕГО хелперах: cancel-sweep → verify → гарантированная продажа/покупка;
+// OCO вместо пары sell; провал брекетов = раскрутка с типизацией исходной ошибки.
 import {
   addExchangeSchema,
   roundTicks,
@@ -33,19 +38,15 @@ import { singleshot, sleep } from "functools-kit";
 import ccxt from "ccxt";
 
 type Binance = InstanceType<typeof ccxt.binance>;
-type Order = Awaited<ReturnType<Binance["fetchOpenOrders"]>>[number];
 
 setConfig({
   CC_MAX_STOPLOSS_DISTANCE_PERCENT: 100,
-  // Размер входа $20 (решение владельца 22.07, №112а): депозит ~$95 —
-  // с дефолтными $100 сайзинг упирался в баланс (NOTIONAL/Insufficient, №111);
-  // $20 = до 4 одновременных позиций + запас над биржевым минимумом $5.
-  // ⚠️ Именно ЭТОТ модуль грузит CLI (--entry → chdir в папку стратегии);
-  // корневой modules/live.module.ts рантаймом live НЕ используется.
+  // Размер входа $20: депозит ~$95 — до 4 одновременных позиций + запас над
+  // биржевым минимумом $5 (решение владельца 22.07, №112а).
   CC_POSITION_ENTRY_COST: 20,
 });
 
-// --- Данные: публичный spot-клиент (схема автора) ---
+// --- Данные: публичный spot-клиент ---
 
 const getExchange = singleshot(async () => {
   const exchange = new ccxt.binance({
@@ -114,31 +115,18 @@ addExchangeSchema({
   },
 });
 
-// --- Исполнение: авторский Binance Spot адаптер + retry-API 16.0.0 ---
-// (ANSWER.md автора, agent/notes/author-answer-retry-api.md в paperhands):
-// сеть → OrderTransientError (bounded retry с тем же signalId), отказ биржи
-// навсегда → OrderRejectedError (дроп/force-close). Идемпотентность входа:
-// clientOrderId = signalId; при attempt>0 СНАЧАЛА reconcile по origClientOrderId
-// (duplicate-ловушка Binance не срабатывает для мгновенно исполненных ордеров —
-// clientOrderId уникален только среди ОТКРЫТЫХ; сценарий №88/PENGU ловится
-// именно предварительной сверкой).
+// --- Исполнение ---
 
-const FILL_POLL_INTERVAL_MS = 10_000;
-const FILL_POLL_ATTEMPTS = 10;
-const CANCEL_SETTLE_MS = 2_000;
-const STOP_LIMIT_SLIPPAGE = 0.995;
-// Правило 3 из ANSWER.md Петра (23.07, №117): бюджет движка
-// CC_ORDER_OPEN_RETRY_ATTEMPTS=5 → attempt 0..4; на attempt=4 — терминальный
-// OrderRejectedError (движок потребляет signalId, переизданий больше нет).
-const LAST_OPEN_ATTEMPT = 4;
-// Правило «снять ВСЁ и выйти в кеш» на закрытии: заходы отмены (единичные
-// отказы cancel терпимы — заход повторяется), затем проверка что стакан чист.
-const CANCEL_ROUNDS = 10;
+const FILL_POLL_INTERVAL_MS = 10_000;   // полл филла: 10 проверок ...
+const FILL_POLL_ATTEMPTS = 10;          // ... раз в 10 секунд = до ~100с ожидания
+const CANCEL_SETTLE_MS = 2_000;         // пауза после cancel перед перечитыванием
+const CANCEL_ROUNDS = 10;               // заходы cancel-sweep при закрытии
+const STOP_LIMIT_SLIPPAGE = 0.995;      // stop-limit цена чуть ниже триггера SL
+const TRADE_SELL_LOWER_PERCENT = 0.999; // лимит-цена выхода чуть ниже рынка
 
 // Сетевой класс ccxt (RequestTimeout, ExchangeNotAvailable, DDoSProtection...)
-// → transient; всё остальное от биржи (InsufficientFunds, InvalidOrder,
-// BadSymbol -1121, min-notional...) → постоянный отказ. Нетипизированное
-// (наши throw) движок сам трактует как transient — их не оборачиваем.
+// → transient (bounded retry движка с тем же signalId); всё остальное от биржи
+// (InsufficientFunds, InvalidOrder, min-notional...) → постоянный отказ.
 function toTypedError(e: unknown): Error {
   if (e instanceof ccxt.NetworkError) {
     return OrderTransientError.fromError(e as object);
@@ -154,13 +142,13 @@ function isOrderNotFound(e: unknown): boolean {
   return String((e as Error)?.message ?? "").includes("-2013");
 }
 
-// Сверка входа по clientOrderId=signalId: был ли прошлый POST исполнен.
-// null = ордера с таким id нет (слать заново); иначе — сырой ответ Binance.
+// Сверка входа по clientOrderId = signalId: был ли прошлый POST исполнен.
+// null = ордера с таким id нет (слать заново); иначе — статус и исполненный объём.
 async function fetchEntryByClientId(
   exchange: Binance,
   symbol: string,
   signalId: string,
-): Promise<{ status: string; executedQty: number; orderId: string } | null> {
+): Promise<{ orderId: string; status: string; executedQty: number } | null> {
   const market = exchange.market(symbol);
   try {
     const raw = await (exchange as any).privateGetOrder({
@@ -168,9 +156,9 @@ async function fetchEntryByClientId(
       origClientOrderId: signalId,
     });
     return {
+      orderId: String(raw.orderId),
       status: String(raw.status),
       executedQty: parseFloat(raw.executedQty ?? "0"),
-      orderId: String(raw.orderId),
     };
   } catch (e) {
     if (isOrderNotFound(e)) return null;
@@ -198,36 +186,91 @@ function getBase(exchange: Binance, symbol: string): string {
 }
 
 function truncateQty(exchange: Binance, symbol: string, qty: number): number {
-  // ccxt v4: amountToPrecision транкует по умолчанию (в доке автора — старый
-  // 3-аргументный вызов с exchange.TRUNCATE, поведение идентично)
   return parseFloat(exchange.amountToPrecision(symbol, qty));
 }
 
 async function fetchFreeQty(exchange: Binance, symbol: string): Promise<number> {
   const balance = await exchange.fetchBalance();
-  const base    = getBase(exchange, symbol);
+  const base = getBase(exchange, symbol);
   return parseFloat(String(balance?.free?.[base] ?? 0));
 }
 
-async function cancelAllOrders(exchange: Binance, orders: Order[], symbol: string): Promise<void> {
-  await Promise.allSettled(orders.map((o) => exchange.cancelOrder(o.id, symbol)));
-}
-
-async function createStopLossOrder(
+// Отмена с обработкой гонки «филл против cancel»: ордер мог исполниться между
+// последним поллом и cancel — тогда cancel падает (-2011), и это ФИЛЛ, не отказ
+// (исходная версия превращала его в терминальный дроп реально купленного входа).
+async function cancelOrderSafe(
   exchange: Binance,
+  orderId: string,
   symbol: string,
-  qty: number,
-  stopPrice: number
-): Promise<void> {
-  const limitPrice = parseFloat(exchange.priceToPrecision(symbol, stopPrice * STOP_LIMIT_SLIPPAGE));
-  await exchange.createOrder(symbol, "stop_loss_limit", "sell", qty, limitPrice, { stopPrice });
+): Promise<"canceled" | "filled"> {
+  try {
+    await exchange.cancelOrder(orderId, symbol);
+    return "canceled";
+  } catch (cancelErr) {
+    const status = await exchange.fetchOrder(orderId, symbol);
+    if (status.status === "closed") return "filled";
+    throw toTypedError(cancelErr);
+  }
 }
 
-// FIXME.md Петра (№117б), КОРЕНЬ каскада №114: на споте TP+SL на один объём —
-// это ОДИН OCO-ордер (одна заморозка средств), а не два независимых sell.
-// Раньше TP замораживал монеты → SL падал InsufficientFunds → аварийный
-// market-sell падал о ту же заморозку → сырой throw = вечный транзиент.
-async function placeOcoBrackets(
+// commit_cancel: снятие ВСЕХ ордеров по символу с ретраями и ВЕРИФИКАЦИЕЙ, что
+// стакан чист. Продавать можно только незамороженные средства — продажа поверх
+// живого sell-ордера падает insufficient balance (типовая ошибка адаптеров).
+async function cancelSweepAndVerify(exchange: Binance, symbol: string): Promise<void> {
+  {
+    let error: unknown = null;
+    for (let i = 0; i !== CANCEL_ROUNDS; i++) {
+      let isOk = true;
+      const orders = await exchange.fetchOpenOrders(symbol);
+      for (const order of orders) {
+        try {
+          await sleep(1_000);
+          await exchange.cancelOrder(order.id, symbol);
+          error = null;
+        } catch (e) {
+          isOk = false;
+          error = e;
+          continue;
+        }
+      }
+      if (!orders.length) {
+        error = null;
+        break;
+      }
+      if (isOk) {
+        break;
+      }
+    }
+    if (error) {
+      throw toTypedError(error);
+    }
+  }
+  {
+    let error: unknown = null;
+    for (let i = 0; i !== CANCEL_ROUNDS; i++) {
+      try {
+        await sleep(1_000);
+        const { length: hasOrders } = await exchange.fetchOpenOrders(symbol);
+        if (hasOrders) {
+          error = new Error(`Orders still open for ${symbol} after cancel sweep`);
+        } else {
+          error = null;
+          break;
+        }
+      } catch (e) {
+        error = e;
+      }
+    }
+    if (error) {
+      throw toTypedError(error);
+    }
+  }
+}
+
+// commit_trade: TP+SL одним OCO — одна заморозка средств, оба уровня встают
+// атомарно. Исходная пара «limit sell + stop_loss_limit sell» на один объём
+// невозможна на споте: TP замораживал монеты, SL падал InsufficientFunds.
+async function placeBracketsOco(
   exchange: Binance,
   symbol: string,
   qty: number,
@@ -239,93 +282,120 @@ async function placeOcoBrackets(
     symbol: market.id,
     side: "SELL",
     quantity: exchange.amountToPrecision(symbol, qty),
-    price: exchange.priceToPrecision(symbol, tpPrice),
-    stopPrice: exchange.priceToPrecision(symbol, slPrice),
+    price: exchange.priceToPrecision(symbol, tpPrice),        // TP limit
+    stopPrice: exchange.priceToPrecision(symbol, slPrice),    // SL триггер
     stopLimitPrice: exchange.priceToPrecision(symbol, slPrice * STOP_LIMIT_SLIPPAGE),
     stopLimitTimeInForce: "GTC",
   });
 }
 
-// TODO 5 FIXME: отмена с верификацией — повторять до пустого fetchOpenOrders
-// (allSettled глотает единичные отказы; продавать можно только разморозив всё).
-async function cancelAllVerified(exchange: Binance, symbol: string): Promise<void> {
-  let lastErr: unknown = null;
-  for (let round = 0; round < CANCEL_ROUNDS; round++) {
-    const open = await exchange.fetchOpenOrders(symbol);
-    if (open.length === 0) return;
-    await cancelAllOrders(exchange, open, symbol);
-    await sleep(CANCEL_SETTLE_MS);
-    const left = await exchange.fetchOpenOrders(symbol);
-    if (left.length === 0) return;
-    lastErr = new Error(`Orders not canceled for ${symbol}: ${left.length} left (round ${round + 1})`);
-  }
-  if (lastErr) throw lastErr;
-}
-
-async function createLimitOrderAndWait(
+// SL-одиночка (фолбэк, когда второй ноги для OCO нет — напр. после trailingTake
+// без стопа); используется и хуками breakeven/trailingStop при отсутствии TP.
+async function createStopLossOrder(
   exchange: Binance,
   symbol: string,
-  side: "buy" | "sell",
+  qty: number,
+  stopPrice: number,
+): Promise<void> {
+  const limitPrice = parseFloat(exchange.priceToPrecision(symbol, stopPrice * STOP_LIMIT_SLIPPAGE));
+  await exchange.createOrder(symbol, "stop_loss_limit", "sell", qty, limitPrice, { stopPrice });
+}
+
+// Аварийная раскрутка: СНАЧАЛА разморозить (cancel-sweep + верификация), потом
+// market-sell свободного остатка. Исходная версия продавала то, что сама же
+// заморозила TP-ордером, — раскрутка падала, а сырая ошибка демотировала
+// постоянный отказ биржи до вечного транзиента. Исходная ошибка ВСЕГДА доходит
+// до движка типизированной.
+async function unwindPosition(
+  exchange: Binance,
+  symbol: string,
+  originalErr: unknown,
+): Promise<never> {
+  try {
+    await cancelSweepAndVerify(exchange, symbol);
+    const freeQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+    if (freeQty > 0) {
+      await exchange.createOrder(symbol, "market", "sell", freeQty);
+    }
+  } catch {
+    // раскрутка не удалась — позицию выводит оператор; важнее исходная ошибка
+  }
+  throw toTypedError(originalErr);
+}
+
+// commit_buy: лимитка + полл (await + sleep), по таймауту cancel (гонка учтена)
+// и market-добивка остатка → вход гарантирован, ордер на бирже не остаётся.
+async function buyLimitGuaranteed(
+  exchange: Binance,
+  symbol: string,
   qty: number,
   price: number,
-  restore?: { tpPrice: number; slPrice: number },
   clientOrderId?: string,
 ): Promise<void> {
-  const order = await exchange.createOrder(
-    symbol, "limit", side, qty, price,
-    clientOrderId ? { clientOrderId } : {},
-  );
+  const order = await exchange.createOrder(symbol, "limit", "buy", qty, price,
+    clientOrderId ? { clientOrderId } : {});
 
-  // ANSWER.md Петра (правило 1): транзиентный throw НЕ имеет права оставить
-  // живой ордер на бирже. Любая ошибка поллинга/отмены (сеть в fetchOrder,
-  // гонка «исполнился во время cancel») раньше улетала наверх БЕЗ cancel —
-  // лимитник жил в стакане и исполнялся сам через минуты (каскад №114).
-  // Теперь: ошибка внутри → best-effort cancel → сверка статуса → rethrow.
-  try {
-    for (let i = 0; i < FILL_POLL_ATTEMPTS; i++) {
+  let last = order;
+  if (last.status !== "closed") {
+    let filled = false;
+    for (let i = 0; i !== FILL_POLL_ATTEMPTS; i++) {
       await sleep(FILL_POLL_INTERVAL_MS);
-      const status = await exchange.fetchOrder(order.id, symbol);
-      if (status.status === "closed") return;
+      last = await exchange.fetchOrder(order.id, symbol);
+      if (last.status === "closed") {
+        filled = true;
+        break;
+      }
     }
-    await exchange.cancelOrder(order.id, symbol);
-  } catch (pollErr) {
-    try {
-      await exchange.cancelOrder(order.id, symbol);
-    } catch {
-      // cancel мог упасть потому, что ордер УЖЕ исполнился — сверяем
-    }
-    const check = await exchange.fetchOrder(order.id, symbol).catch(() => null);
-    if (check?.status === "closed") return; // филл настиг во время ошибки — вход подтверждён
-    if (check && check.status === "open") {
-      // снять не смогли, ордер жив — это НЕ транзиент, оставлять нельзя:
-      // ещё одна попытка отмены; если и она мимо — пусть ретрай упрётся в
-      // reconcile по clientOrderId (живой NEW теперь обрабатывается там)
-      await exchange.cancelOrder(order.id, symbol).catch(() => undefined);
-    }
-    throw toTypedError(pollErr);
-  }
-  await sleep(CANCEL_SETTLE_MS);
-
-  const final     = await exchange.fetchOrder(order.id, symbol);
-  const filledQty = final.filled ?? 0;
-
-  if (final.status === "closed") return; // исполнился в окне cancel — вход состоялся
-
-  if (filledQty > 0) {
-    const rollbackSide = side === "buy" ? "sell" : "buy";
-    await exchange.createOrder(symbol, "market", rollbackSide, filledQty);
-  }
-
-  if (restore) {
-    const remainingQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
-    if (remainingQty > 0) {
-      // №117б: восстановление брекетов — тоже атомарный OCO (та же мина
-      // «TP заморозил → SL упал» жила и здесь)
-      await placeOcoBrackets(exchange, symbol, remainingQty, restore.tpPrice, restore.slPrice);
+    if (!filled) {
+      if ((await cancelOrderSafe(exchange, order.id, symbol)) === "filled") {
+        return; // исполнился на флажке — это филл
+      }
+      await sleep(CANCEL_SETTLE_MS);
+      const final = await exchange.fetchOrder(order.id, symbol);
+      const remainder = truncateQty(exchange, symbol, qty - (final.filled ?? 0));
+      if (remainder > 0) {
+        await exchange.createOrder(symbol, "market", "buy", remainder);
+      }
     }
   }
+}
 
-  throw new Error(`Limit order [${side} ${qty} ${symbol} @ ${price}] not filled — backtest-kit will retry`);
+// Зеркало buyLimitGuaranteed для выхода: лимитка чуть ниже рынка + полл, по
+// таймауту cancel (гонка учтена) и market-добивка остатка → выход в кеш
+// гарантирован. Используется close- и partial-хуками.
+async function sellLimitGuaranteed(
+  exchange: Binance,
+  symbol: string,
+  qty: number,
+  currentPrice: number,
+): Promise<void> {
+  const sellPrice = parseFloat(
+    exchange.priceToPrecision(symbol, currentPrice * TRADE_SELL_LOWER_PERCENT),
+  );
+  const order = await exchange.createOrder(symbol, "limit", "sell", qty, sellPrice);
+
+  let last = order;
+  if (last.status !== "closed") {
+    let filled = false;
+    for (let i = 0; i !== FILL_POLL_ATTEMPTS; i++) {
+      await sleep(FILL_POLL_INTERVAL_MS);
+      last = await exchange.fetchOrder(order.id, symbol);
+      if (last.status === "closed") {
+        filled = true;
+        break;
+      }
+    }
+    if (!filled) {
+      if ((await cancelOrderSafe(exchange, order.id, symbol)) !== "filled") {
+        await sleep(CANCEL_SETTLE_MS);
+        const final = await exchange.fetchOrder(order.id, symbol);
+        const remainder = truncateQty(exchange, symbol, qty - (final.filled ?? 0));
+        if (remainder > 0) {
+          await exchange.createOrder(symbol, "market", "sell", remainder);
+        }
+      }
+    }
+  }
 }
 
 Broker.useBrokerAdapter(
@@ -336,143 +406,129 @@ Broker.useBrokerAdapter(
 
     async onOrderOpenCommit(payload: BrokerOrderOpenPayload): Promise<void> {
       if (payload.backtest) return;
-      if (payload.type === "schedule") return;
-      const { symbol, signalId, cost, priceOpen, priceTakeProfit, priceStopLoss, position, attempt } = payload;
+      if (payload.type === "schedule") return; // отложенный вход отслеживает движок
+      const { symbol, signalId, cost, priceOpen, priceTakeProfit, priceStopLoss, position } = payload;
 
       if (position === "short") {
         // бизнес-отказ навсегда: спот шортов не знает — дроп без ретраев
-        throw new OrderRejectedError(`SpotBrokerAdapter: short position is not supported on spot (symbol=${symbol})`);
+        throw new OrderRejectedError(
+          `SpotBrokerAdapter: short position is not supported on spot (symbol=${symbol})`,
+        );
       }
 
       const exchange = await getSpotExchange();
 
-      // СПОТ-САЙЗИНГ ПО КЭШУ (владелец 20.07): на споте плеча нет и купить можно
-      // только на живой USDT. Движок даёт номинальный cost (CC_POSITION_ENTRY_COST
-      // $100 по умолчанию, moonbag свой cost не задаёт) — если он больше кэша,
-      // Binance режет "insufficient balance". Берём min(номинал, 98% свободного
-      // USDT) — запас 2% на комиссию/округление. backtest/paper сюда не заходят
-      // (payload.backtest отсечён в начале onOrderOpenCommit).
-      const quoteCcy: string = "USDT";
-      const freeUsdt      = parseFloat(String((await exchange.fetchBalance())?.free?.[quoteCcy] ?? 0));
-      const effectiveCost = Math.min(cost, freeUsdt * 0.98);
-      const minNotional   = exchange.markets[symbol]?.limits?.cost?.min ?? 1;
-      if (effectiveCost < minNotional) {
-        // кэша меньше минимального нотионала биржи — торговать нечем; постоянный
-        // дроп без ретраев (OrderRejectedError), чтобы не спамить каждую минуту.
-        throw new OrderRejectedError(
-          `SpotBrokerAdapter: free USDT ${freeUsdt.toFixed(2)} → cost ${effectiveCost.toFixed(2)} < minNotional ${minNotional} (${symbol}) — вход пропущен`,
-        );
-      }
-      const qty = truncateQty(exchange, symbol, effectiveCost / priceOpen);
-
-      if (qty <= 0) {
-        throw new OrderRejectedError(`Computed qty is zero for ${symbol} — cost=${effectiveCost}, price=${priceOpen}`);
-      }
-
       const openPrice = parseFloat(exchange.priceToPrecision(symbol, priceOpen));
-      const tpPrice   = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
-      const slPrice   = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const tpPrice = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
+      const slPrice = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
+      const minNotional = exchange.markets[symbol]?.limits?.cost?.min ?? 1;
 
-      // TODO 2 FIXME: раскрутка = СНАЧАЛА cancel всего, что заморозило монеты,
-      // ПОТОМ market-sell по факту свободного остатка; типизация ИСХОДНОЙ
-      // ошибки доходит до движка всегда (раньше сырой InsufficientFunds из
-      // раскрутки демотировал постоянный отказ в вечный транзиент).
-      const unwindPosition = async (unwQty: number, originalErr: unknown): Promise<never> => {
+      // Брекеты на фактический свободный остаток; провал брекетов = провал
+      // входа целиком: раскрутка (cancel first → market sell) + типизированный
+      // вердикт движку.
+      const confirmWithBrackets = async (): Promise<void> => {
+        const bracketQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+        if (bracketQty <= 0) return;
         try {
-          const open = await exchange.fetchOpenOrders(symbol);
-          await cancelAllOrders(exchange, open, symbol);
-          await sleep(CANCEL_SETTLE_MS);
-          const freeQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
-          if (freeQty > 0) {
-            await exchange.createOrder(symbol, "market", "sell", Math.min(freeQty, unwQty));
-          }
-        } catch {
-          // раскрутка не удалась — позицию выводит оператор; исходная ошибка важнее
-        }
-        throw toTypedError(originalErr);
-      };
-
-      const placeBrackets = async (bracketQty: number): Promise<void> => {
-        try {
-          await placeOcoBrackets(exchange, symbol, bracketQty, tpPrice, slPrice);
+          await placeBracketsOco(exchange, symbol, bracketQty, tpPrice, slPrice);
         } catch (err) {
-          await unwindPosition(bracketQty, err);
+          await unwindPosition(exchange, symbol, err);
         }
       };
 
       try {
-        // TODO 3 FIXME (№117б): сверка по clientOrderId БЕЗУСЛОВНА, не только
-        // при attempt>0 — после дропа ретрай-слота consumption-ревалидацией
-        // свежая строка приходит с attempt=0 и ТЕМ ЖЕ id, а clientOrderId
-        // исполненного ордера Binance переиспользует (дубль-гард только среди
-        // ОТКРЫТЫХ). Гейт по attempt и превращал один сбой брекетов в
-        // лестницу покупок (№114). Цена сверки для нового id — один вызов
-        // (-2013 → null → слать заново).
+        // Сверка по clientOrderId = signalId БЕЗУСЛОВНА, не только при attempt > 0:
+        // свежая строка того же id (после дропа ретрай-слота ревалидацией движка)
+        // приходит с attempt = 0 — гард по attempt пропускал её и покупал повторно.
+        // Для нового id сверка стоит один вызов (-2013 → null → слать заново).
         const prior = await fetchEntryByClientId(exchange, symbol, signalId);
+
         if (prior && prior.executedQty > 0) {
-          const bracketQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
-          if (bracketQty > 0) await placeBrackets(bracketQty);
-          return; // вход уже куплен прошлой попыткой — покупку НЕ повторяем
-        }
-        if (prior && prior.status === "NEW") {
-          // живой resting-ордер — ждём ЕГО, а не постим дубль (-2010)
-          throw OrderTransientError.fromError(
-            new Error(`entry ${signalId} still resting — waiting`),
-          );
-        }
-        await createLimitOrderAndWait(exchange, symbol, "buy", qty, openPrice, undefined, signalId);
-      } catch (err) {
-        // Правило 3 ANSWER.md: бюджет движка исчерпан (attempt 0..4) —
-        // снять свой resting-ордер, если остался, и отказаться ТЕРМИНАЛЬНО:
-        // OrderRejectedError потребляет id, сигнал больше не переиздаётся.
-        if (attempt >= LAST_OPEN_ATTEMPT) {
-          const leftover = await fetchEntryByClientId(exchange, symbol, signalId).catch(() => null);
-          if (leftover && (leftover.status === "NEW" || leftover.status === "PARTIALLY_FILLED")) {
-            await exchange.cancelOrder(leftover.orderId, symbol).catch(() => undefined);
+          // Прошлый POST исполнился (потерянный ответ / крэш до брекетов).
+          const freeQty = await fetchFreeQty(exchange, symbol);
+          if (freeQty * openPrice >= minNotional) {
+            await confirmWithBrackets();
+            return; // вход подтверждён по clientOrderId — покупку НЕ повторяем
           }
+          // остатка нет — прошлый вход уже раскручен (unwind), покупаем заново
+        } else if (prior && (prior.status === "NEW" || prior.status === "PARTIALLY_FILLED")) {
+          // Живой ордер прошлой попытки: СНАЧАЛА снять (clientOrderId
+          // освобождается — не будет -2010 duplicate), потом открывать заново.
+          // Исходная версия постила дубль поверх живого NEW → -2010 →
+          // терминальный дроп при живом собственном ордере на бирже.
+          if ((await cancelOrderSafe(exchange, prior.orderId, symbol)) === "filled") {
+            await confirmWithBrackets();
+            return; // исполнился на флажке — это филл прошлой попытки
+          }
+          await sleep(CANCEL_SETTLE_MS);
+        }
+
+        // СПОТ-САЙЗИНГ ПО КЭШУ: на споте купить можно только на живой USDT.
+        // min(номинал, 98% свободного USDT) — запас 2% на комиссию/округление.
+        const freeUsdt = parseFloat(String((await exchange.fetchBalance())?.free?.["USDT"] ?? 0));
+        const effectiveCost = Math.min(cost, freeUsdt * 0.98);
+        if (effectiveCost < minNotional) {
+          // кэша меньше минимального нотионала — торговать нечем; постоянный
+          // дроп без ретраев, чтобы не спамить каждую минуту
           throw new OrderRejectedError(
-            `entry ${signalId} not filled after ${attempt + 1} attempts — giving up`,
+            `SpotBrokerAdapter: free USDT ${freeUsdt.toFixed(2)} → cost ${effectiveCost.toFixed(2)} < minNotional ${minNotional} (${symbol}) — вход пропущен`,
           );
         }
+        const qty = truncateQty(exchange, symbol, effectiveCost / priceOpen);
+        if (qty <= 0) {
+          throw new OrderRejectedError(
+            `Computed qty is zero for ${symbol} — cost=${effectiveCost}, price=${priceOpen}`,
+          );
+        }
+
+        await buyLimitGuaranteed(exchange, symbol, qty, openPrice, signalId);
+      } catch (err) {
         throw toTypedError(err);
       }
 
-      await placeBrackets(qty);
+      await confirmWithBrackets();
     }
 
     async onOrderCloseCommit(payload: BrokerOrderClosePayload): Promise<void> {
       if (payload.backtest) return;
-      const { symbol, currentPrice, priceTakeProfit, priceStopLoss } = payload;
+      const { symbol, currentPrice } = payload;
       const exchange = await getSpotExchange();
 
       try {
-        // Шаги 1-2 ANSWER.md: снять ВСЕ ордера символа с повторами и убедиться,
-        // что стакан по символу чист (включая артефакты прошлых попыток и TP
-        // траншей-сирот) — только потом выходить в кеш.
-        await cancelAllVerified(exchange, symbol); // throw = транзиент, движок ретраит close
+        // Шаги 1-2 (commit_cancel): разморозить средства и УБЕДИТЬСЯ, что по
+        // символу не осталось ни одного живого ордера — только после этого
+        // весь баланс монеты доступен к продаже.
+        await cancelSweepAndVerify(exchange, symbol);
 
-        const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
-        if (qty === 0) return;
+        // Шаг 3: выйти в кеш — продать ВЕСЬ свободный баланс монеты (не только
+        // объём позиции движка: заодно подметаются транши-сироты).
+        const freeQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
+        const minNotional = exchange.markets[symbol]?.limits?.cost?.min ?? 1;
+        if (freeQty * currentPrice < minNotional) {
+          return; // пыль — позиция уже пуста, закрытие подтверждаем
+        }
 
-        const closePrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
-        const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
-        const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
-
-        await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+        await sellLimitGuaranteed(exchange, symbol, freeQty, currentPrice);
       } catch (err) {
-        // сеть → transient (ретрай следующим тиком, bounded CC_ORDER_CLOSE_RETRY_ATTEMPTS,
-        // затем force-close движка — реальную позицию выводит оператор/дежурство);
-        // отказ биржи → rejected (force-close сразу, наш кейс «продавца нет»)
+        // сеть → transient: движок держит позицию и ретраит close следующим
+        // тиком (bounded CC_ORDER_CLOSE_RETRY_ATTEMPTS, затем force-close —
+        // реальную позицию выводит оператор); отказ биржи → rejected.
+        // Брекеты при этом уже сняты — до успешного close позицию сторожит
+        // софт-SL движка, повторный заход начнётся с cancel-sweep (идемпотентно).
         throw toTypedError(err);
       }
     }
+
+    // ==== Хуки ниже — вне файла Петра, по его правилу «те же принципы»:
+    // ==== cancel-sweep → verify → гарантированная продажа/покупка; OCO вместо
+    // ==== пары sell; провал брекетов = раскрутка + типизированный вердикт.
 
     async onPartialProfitCommit(payload: BrokerPartialProfitPayload): Promise<void> {
       if (payload.backtest) return;
       const { symbol, percentToClose, currentPrice, priceTakeProfit, priceStopLoss } = payload;
       const exchange = await getSpotExchange();
 
-      await cancelAllVerified(exchange, symbol); // №117б: продавать/докупать только разморозив всё
+      await cancelSweepAndVerify(exchange, symbol);
 
       const totalQty = await fetchFreeQty(exchange, symbol);
       if (totalQty === 0) {
@@ -481,18 +537,16 @@ Broker.useBrokerAdapter(
 
       const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
       const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
-      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
       const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
       const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
 
-      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+      await sellLimitGuaranteed(exchange, symbol, qty, currentPrice);
 
       if (remainingQty > 0) {
         try {
-          await placeOcoBrackets(exchange, symbol, remainingQty, tpPrice, slPrice); // №117б
+          await placeBracketsOco(exchange, symbol, remainingQty, tpPrice, slPrice);
         } catch (err) {
-          await exchange.createOrder(symbol, "market", "sell", remainingQty);
-          throw err;
+          await unwindPosition(exchange, symbol, err);
         }
       }
     }
@@ -502,7 +556,7 @@ Broker.useBrokerAdapter(
       const { symbol, percentToClose, currentPrice, priceTakeProfit, priceStopLoss } = payload;
       const exchange = await getSpotExchange();
 
-      await cancelAllVerified(exchange, symbol); // №117б: продавать/докупать только разморозив всё
+      await cancelSweepAndVerify(exchange, symbol);
 
       const totalQty = await fetchFreeQty(exchange, symbol);
       if (totalQty === 0) {
@@ -511,18 +565,16 @@ Broker.useBrokerAdapter(
 
       const qty          = truncateQty(exchange, symbol, totalQty * (percentToClose / 100));
       const remainingQty = truncateQty(exchange, symbol, totalQty - qty);
-      const closePrice   = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
       const tpPrice      = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
       const slPrice      = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
 
-      await createLimitOrderAndWait(exchange, symbol, "sell", qty, closePrice, { tpPrice, slPrice });
+      await sellLimitGuaranteed(exchange, symbol, qty, currentPrice);
 
       if (remainingQty > 0) {
         try {
-          await placeOcoBrackets(exchange, symbol, remainingQty, tpPrice, slPrice); // №117б
+          await placeBracketsOco(exchange, symbol, remainingQty, tpPrice, slPrice);
         } catch (err) {
-          await exchange.createOrder(symbol, "market", "sell", remainingQty);
-          throw err;
+          await unwindPosition(exchange, symbol, err);
         }
       }
     }
@@ -532,11 +584,11 @@ Broker.useBrokerAdapter(
       const { symbol, newStopLossPrice } = payload;
       const exchange = await getSpotExchange();
 
-      // №117б: брекеты теперь OCO — отмена одной ноги гасит обе, поэтому
-      // запоминаем цену TP-ноги, сносим всё верифицированно и пересобираем пару.
-      const orders  = await exchange.fetchOpenOrders(symbol);
-      const tpLeg   = orders.find((o) => o.side === "sell" && ["limit", "LIMIT"].includes(o.type ?? "")) ?? null;
-      await cancelAllVerified(exchange, symbol);
+      // Брекеты = OCO: снятие одной ноги гасит обе → запоминаем цену TP-ноги,
+      // сносим всё верифицированно и пересобираем пару с новым SL.
+      const orders = await exchange.fetchOpenOrders(symbol);
+      const tpLeg  = orders.find((o) => o.side === "sell" && ["limit", "LIMIT"].includes(o.type ?? "")) ?? null;
+      await cancelSweepAndVerify(exchange, symbol);
 
       const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
       if (qty === 0) {
@@ -544,10 +596,14 @@ Broker.useBrokerAdapter(
       }
 
       const slPrice = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
-      if (tpLeg?.price) {
-        await placeOcoBrackets(exchange, symbol, qty, Number(tpLeg.price), slPrice);
-      } else {
-        await createStopLossOrder(exchange, symbol, qty, slPrice);
+      try {
+        if (tpLeg?.price) {
+          await placeBracketsOco(exchange, symbol, qty, Number(tpLeg.price), slPrice);
+        } else {
+          await createStopLossOrder(exchange, symbol, qty, slPrice);
+        }
+      } catch (err) {
+        await unwindPosition(exchange, symbol, err);
       }
     }
 
@@ -556,14 +612,14 @@ Broker.useBrokerAdapter(
       const { symbol, newTakeProfitPrice } = payload;
       const exchange = await getSpotExchange();
 
-      // №117б: OCO-пересборка — запоминаем стоп-ногу, сносим всё, ставим пару заново.
-      const orders  = await exchange.fetchOpenOrders(symbol);
-      const slLeg   = orders.find((o) =>
+      // Симметрично trailingStop: запоминаем стоп-ногу, пересобираем OCO с новым TP.
+      const orders = await exchange.fetchOpenOrders(symbol);
+      const slLeg  = orders.find((o) =>
         o.side === "sell" &&
         ["stop_loss_limit", "stop", "STOP_LOSS_LIMIT"].includes(o.type ?? "")
       ) ?? null;
       const slTrigger = Number((slLeg as any)?.stopPrice ?? (slLeg as any)?.triggerPrice ?? 0);
-      await cancelAllVerified(exchange, symbol);
+      await cancelSweepAndVerify(exchange, symbol);
 
       const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
       if (qty === 0) {
@@ -571,10 +627,14 @@ Broker.useBrokerAdapter(
       }
 
       const tpPrice = parseFloat(exchange.priceToPrecision(symbol, newTakeProfitPrice));
-      if (slTrigger > 0) {
-        await placeOcoBrackets(exchange, symbol, qty, tpPrice, slTrigger);
-      } else {
-        await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
+      try {
+        if (slTrigger > 0) {
+          await placeBracketsOco(exchange, symbol, qty, tpPrice, slTrigger);
+        } else {
+          await exchange.createOrder(symbol, "limit", "sell", qty, tpPrice);
+        }
+      } catch (err) {
+        await unwindPosition(exchange, symbol, err);
       }
     }
 
@@ -583,10 +643,10 @@ Broker.useBrokerAdapter(
       const { symbol, newStopLossPrice } = payload;
       const exchange = await getSpotExchange();
 
-      // №117б: OCO-пересборка (см. onTrailingStopCommit).
-      const orders  = await exchange.fetchOpenOrders(symbol);
-      const tpLeg   = orders.find((o) => o.side === "sell" && ["limit", "LIMIT"].includes(o.type ?? "")) ?? null;
-      await cancelAllVerified(exchange, symbol);
+      // OCO-пересборка (см. onTrailingStopCommit).
+      const orders = await exchange.fetchOpenOrders(symbol);
+      const tpLeg  = orders.find((o) => o.side === "sell" && ["limit", "LIMIT"].includes(o.type ?? "")) ?? null;
+      await cancelSweepAndVerify(exchange, symbol);
 
       const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
       if (qty === 0) {
@@ -594,10 +654,14 @@ Broker.useBrokerAdapter(
       }
 
       const slPrice = parseFloat(exchange.priceToPrecision(symbol, newStopLossPrice));
-      if (tpLeg?.price) {
-        await placeOcoBrackets(exchange, symbol, qty, Number(tpLeg.price), slPrice);
-      } else {
-        await createStopLossOrder(exchange, symbol, qty, slPrice);
+      try {
+        if (tpLeg?.price) {
+          await placeBracketsOco(exchange, symbol, qty, Number(tpLeg.price), slPrice);
+        } else {
+          await createStopLossOrder(exchange, symbol, qty, slPrice);
+        }
+      } catch (err) {
+        await unwindPosition(exchange, symbol, err);
       }
     }
 
@@ -606,38 +670,43 @@ Broker.useBrokerAdapter(
       const { symbol, currentPrice, cost, priceTakeProfit, priceStopLoss } = payload;
       const exchange = await getSpotExchange();
 
-      await cancelAllVerified(exchange, symbol); // №117б: продавать/докупать только разморозив всё
+      await cancelSweepAndVerify(exchange, symbol);
 
       const existing    = await fetchFreeQty(exchange, symbol);
-      const minNotional = exchange.markets[symbol].limits?.cost?.min ?? 1;
-
+      const minNotional = exchange.markets[symbol]?.limits?.cost?.min ?? 1;
       if (existing * currentPrice < minNotional) {
         throw new Error(`AverageBuy skipped: no open position for ${symbol}`);
       }
 
-      const qty = truncateQty(exchange, symbol, cost / currentPrice);
+      // Сайзинг DCA — по кэшу, как у входа (min(номинал, 98% свободного USDT)).
+      const freeUsdt = parseFloat(String((await exchange.fetchBalance())?.free?.["USDT"] ?? 0));
+      const effectiveCost = Math.min(cost, freeUsdt * 0.98);
+      if (effectiveCost < minNotional) {
+        throw new OrderRejectedError(
+          `AverageBuy: free USDT ${freeUsdt.toFixed(2)} < minNotional ${minNotional} (${symbol}) — DCA пропущен`,
+        );
+      }
+      const qty = truncateQty(exchange, symbol, effectiveCost / currentPrice);
       if (qty <= 0) {
-        throw new Error(`Computed qty is zero for ${symbol} — cost=${cost}, price=${currentPrice}`);
+        throw new Error(`Computed qty is zero for ${symbol} — cost=${effectiveCost}, price=${currentPrice}`);
       }
 
       const entryPrice = parseFloat(exchange.priceToPrecision(symbol, currentPrice));
       const tpPrice    = parseFloat(exchange.priceToPrecision(symbol, priceTakeProfit));
       const slPrice    = parseFloat(exchange.priceToPrecision(symbol, priceStopLoss));
 
-      await createLimitOrderAndWait(exchange, symbol, "buy", qty, entryPrice, { tpPrice, slPrice });
+      await buyLimitGuaranteed(exchange, symbol, qty, entryPrice);
 
       const totalQty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
-
       try {
-        await placeOcoBrackets(exchange, symbol, totalQty, tpPrice, slPrice); // №117б
+        await placeBracketsOco(exchange, symbol, totalQty, tpPrice, slPrice);
       } catch (err) {
-        await exchange.createOrder(symbol, "market", "sell", totalQty);
-        throw err;
+        await unwindPosition(exchange, symbol, err);
       }
     }
-  }
+  },
 );
 
 Broker.enable();
-// listenExit НЕ вайрим: @backtest-kit/cli сам дропает процесс на exitEmitter
-// (cli/src/config/setup.ts:46, поправка автора 17.07) — systemd перезапустит.
+// listenExit НЕ вайрим: @backtest-kit/cli сам дропает процесс на exitEmitter —
+// systemd перезапустит.

@@ -127,6 +127,13 @@ const FILL_POLL_INTERVAL_MS = 10_000;
 const FILL_POLL_ATTEMPTS = 10;
 const CANCEL_SETTLE_MS = 2_000;
 const STOP_LIMIT_SLIPPAGE = 0.995;
+// Правило 3 из ANSWER.md Петра (23.07, №117): бюджет движка
+// CC_ORDER_OPEN_RETRY_ATTEMPTS=5 → attempt 0..4; на attempt=4 — терминальный
+// OrderRejectedError (движок потребляет signalId, переизданий больше нет).
+const LAST_OPEN_ATTEMPT = 4;
+// Правило «снять ВСЁ и выйти в кеш» на закрытии: заходы отмены (единичные
+// отказы cancel терпимы — заход повторяется), затем проверка что стакан чист.
+const CANCEL_ROUNDS = 10;
 
 // Сетевой класс ccxt (RequestTimeout, ExchangeNotAvailable, DDoSProtection...)
 // → transient; всё остальное от биржи (InsufficientFunds, InvalidOrder,
@@ -153,14 +160,18 @@ async function fetchEntryByClientId(
   exchange: Binance,
   symbol: string,
   signalId: string,
-): Promise<{ status: string; executedQty: number } | null> {
+): Promise<{ status: string; executedQty: number; orderId: string } | null> {
   const market = exchange.market(symbol);
   try {
     const raw = await (exchange as any).privateGetOrder({
       symbol: market.id,
       origClientOrderId: signalId,
     });
-    return { status: String(raw.status), executedQty: parseFloat(raw.executedQty ?? "0") };
+    return {
+      status: String(raw.status),
+      executedQty: parseFloat(raw.executedQty ?? "0"),
+      orderId: String(raw.orderId),
+    };
   } catch (e) {
     if (isOrderNotFound(e)) return null;
     throw toTypedError(e);
@@ -226,17 +237,40 @@ async function createLimitOrderAndWait(
     clientOrderId ? { clientOrderId } : {},
   );
 
-  for (let i = 0; i < FILL_POLL_ATTEMPTS; i++) {
-    await sleep(FILL_POLL_INTERVAL_MS);
-    const status = await exchange.fetchOrder(order.id, symbol);
-    if (status.status === "closed") return;
+  // ANSWER.md Петра (правило 1): транзиентный throw НЕ имеет права оставить
+  // живой ордер на бирже. Любая ошибка поллинга/отмены (сеть в fetchOrder,
+  // гонка «исполнился во время cancel») раньше улетала наверх БЕЗ cancel —
+  // лимитник жил в стакане и исполнялся сам через минуты (каскад №114).
+  // Теперь: ошибка внутри → best-effort cancel → сверка статуса → rethrow.
+  try {
+    for (let i = 0; i < FILL_POLL_ATTEMPTS; i++) {
+      await sleep(FILL_POLL_INTERVAL_MS);
+      const status = await exchange.fetchOrder(order.id, symbol);
+      if (status.status === "closed") return;
+    }
+    await exchange.cancelOrder(order.id, symbol);
+  } catch (pollErr) {
+    try {
+      await exchange.cancelOrder(order.id, symbol);
+    } catch {
+      // cancel мог упасть потому, что ордер УЖЕ исполнился — сверяем
+    }
+    const check = await exchange.fetchOrder(order.id, symbol).catch(() => null);
+    if (check?.status === "closed") return; // филл настиг во время ошибки — вход подтверждён
+    if (check && check.status === "open") {
+      // снять не смогли, ордер жив — это НЕ транзиент, оставлять нельзя:
+      // ещё одна попытка отмены; если и она мимо — пусть ретрай упрётся в
+      // reconcile по clientOrderId (живой NEW теперь обрабатывается там)
+      await exchange.cancelOrder(order.id, symbol).catch(() => undefined);
+    }
+    throw toTypedError(pollErr);
   }
-
-  await exchange.cancelOrder(order.id, symbol);
   await sleep(CANCEL_SETTLE_MS);
 
   const final     = await exchange.fetchOrder(order.id, symbol);
   const filledQty = final.filled ?? 0;
+
+  if (final.status === "closed") return; // исполнился в окне cancel — вход состоялся
 
   if (filledQty > 0) {
     const rollbackSide = side === "buy" ? "sell" : "buy";
@@ -312,9 +346,11 @@ Broker.useBrokerAdapter(
       };
 
       try {
-        // №88/PENGU: ретрай (attempt>0) СНАЧАЛА сверяется — вдруг прошлый POST
-        // дошёл и исполнился, а ответ съела сеть. FILLED → достаточно докинуть
-        // TP/SL; живой NEW — ждать его же; нет ордера — слать заново.
+        // №88/PENGU + правило 2 ANSWER.md (№117): ретрай (attempt>0) СНАЧАЛА
+        // сверяется по clientOrderId — прошлый POST мог дойти до биржи.
+        // FILLED/частично исполнен → докинуть TP/SL, покупку НЕ повторять.
+        // Живой NEW → СНЯТЬ (раньше проваливались в новый POST с тем же
+        // clientOrderId → дубль-реджект, а оригинал жил в стакане — каскад №114).
         if (attempt > 0) {
           const prior = await fetchEntryByClientId(exchange, symbol, signalId);
           if (prior && prior.executedQty > 0) {
@@ -322,9 +358,22 @@ Broker.useBrokerAdapter(
             if (bracketQty > 0) await placeBrackets(bracketQty);
             return; // вход подтверждён по clientOrderId — покупку НЕ повторяем
           }
+          if (prior && (prior.status === "NEW" || prior.status === "PARTIALLY_FILLED")) {
+            await exchange.cancelOrder(prior.orderId, symbol).catch(() => undefined);
+            await sleep(CANCEL_SETTLE_MS);
+          }
         }
         await createLimitOrderAndWait(exchange, symbol, "buy", qty, openPrice, undefined, signalId);
       } catch (err) {
+        // Правило 3 ANSWER.md: на последней попытке бюджета движка — терминальный
+        // отказ (helper уже снял ордер и откатил частичный филл маркетом).
+        // OrderRejectedError движок потребляет в lastPendingId — сигнал с этим
+        // id больше не переиздаётся, каскад невозможен.
+        if (attempt >= LAST_OPEN_ATTEMPT) {
+          throw new OrderRejectedError(
+            `entry ${signalId} not filled after ${attempt + 1} attempts — giving up`,
+          );
+        }
         throw toTypedError(err);
       }
 
@@ -337,9 +386,20 @@ Broker.useBrokerAdapter(
       const exchange = await getSpotExchange();
 
       try {
-        const openOrders = await exchange.fetchOpenOrders(symbol);
-        await cancelAllOrders(exchange, openOrders, symbol);
-        await sleep(CANCEL_SETTLE_MS);
+        // Шаги 1-2 ANSWER.md: снять ВСЕ ордера символа с повторами и убедиться,
+        // что стакан по символу чист (включая артефакты прошлых попыток и TP
+        // траншей-сирот) — только потом выходить в кеш.
+        let cancelError: unknown = null;
+        for (let round = 0; round < CANCEL_ROUNDS; round++) {
+          const openOrders = await exchange.fetchOpenOrders(symbol);
+          if (openOrders.length === 0) { cancelError = null; break; }
+          await cancelAllOrders(exchange, openOrders, symbol);
+          await sleep(CANCEL_SETTLE_MS);
+          const left = await exchange.fetchOpenOrders(symbol);
+          if (left.length === 0) { cancelError = null; break; }
+          cancelError = new Error(`Orders not canceled for ${symbol}: ${left.length} left (round ${round + 1})`);
+        }
+        if (cancelError) throw cancelError; // транзиент — движок ретраит close
 
         const qty = truncateQty(exchange, symbol, await fetchFreeQty(exchange, symbol));
         if (qty === 0) return;
